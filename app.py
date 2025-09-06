@@ -22,6 +22,14 @@ from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 import time
 import policy  # importa el motor de reglas
+import psycopg2
+from psycopg2 import sql
+
+"""**CONEXIÓN CON CON LA BASE DE DATOS**"""
+
+DATABASE_URL = os.environ["DATABASE_URL"]  # definida en Render
+CONN = psycopg2.connect(DATABASE_URL)
+CONN.autocommit = True
 
 """**CARGA DE ARCHIVOS NECESARIOS**"""
 
@@ -40,6 +48,48 @@ try:
     CLASSES = getattr(MODEL, "classes_", SCHEMA.get("classes", []))
 except Exception as e:
     raise RuntimeError(f"No pude cargar el schema en {SCHEMA_PATH}: {e}")
+
+"""**Configuración para insertar cada ventana en /ingest**"""
+
+# Commented out IPython magic to ensure Python compatibility.
+TABLE = "windows"
+USER_COL = "id_usuario"
+
+def insert_window_pg(
+    session_id: str,
+    device_id: str,
+    ts_start: float,
+    ts_end: float,
+    features_row: dict,
+    pred_label: str,
+    conf: float,
+    start_index: int | None = None,
+    end_index: int | None = None,
+    n_muestras: int | None = None,
+    gold_label: str | None = None,
+):
+    feats_json = json.dumps({k: features_row[k] for k in FEATURES})
+    with CONN.cursor() as cur:
+        cur.execute(sql.SQL("""
+            INSERT INTO {tbl} (
+              {user}, session_id, received_at, start_time, end_time,
+              start_index, end_index, n_muestras,
+              activity, etiqueta, features
+            )
+            VALUES (
+#               %s, %s, now(), to_timestamp(%s), to_timestamp(%s),
+#               %s, %s, %s,
+#               %s, %s, %s::jsonb
+            )
+        """).format(
+            tbl=sql.Identifier("windows"),
+            user=sql.Identifier("id_usuario"),
+        ), [
+            device_id, session_id,
+            float(ts_start), float(ts_end),
+            start_index, end_index, n_muestras,
+            str(pred_label), gold_label, feats_json
+        ])
 
 """**Configuraciones para conexión remota**"""
 
@@ -132,6 +182,19 @@ def ingest(w: Window):
     idx  = int(proba.argmax(axis=1)[0])
     label = CLASSES[idx] if len(CLASSES) else idx
 
+    #--- Insertar en la BD---
+    insert_window_pg(
+    session_id=w.session_id,
+    device_id=w.device_id,      # se guarda en id_usuario
+    ts_start=float(w.ts_start),
+    ts_end=float(w.ts_end),
+    features_row=row,
+    pred_label=str(label),
+    conf=float(conf),
+    start_index=None, end_index=None, n_muestras=None,
+    gold_label=None
+    )
+
     # --- Policy Engine ---
     center_ts = (w.ts_start + w.ts_end) / 2.0
     ask, reason = policy.should_ask(session_id=w.session_id, conf=conf, now_ts=center_ts)
@@ -139,7 +202,6 @@ def ingest(w: Window):
         policy.mark_asked(w.session_id, now_ts=center_ts)
 
     # Variables  (ventana, pred, conf, ask, reason) para guardar en la BD
-
     return {
         "pred_label": str(label),
         "confianza": conf,
@@ -153,6 +215,31 @@ def ingest(w: Window):
 
 @app.post("/label")
 def label_endpoint(payload: LabelIn):
-    # Aquí SOLO registramos el evento (keep-alive). El alineador por intervalos vendrá después.
     policy.mark_labeled(payload.session_id, now_ts=time.time())
-    return {"ok": True}
+
+    end_ts = float(time.time())
+    dur = float(payload.duration_s or 60)
+    start_ts = end_ts - dur
+
+    with CONN.cursor() as cur:
+        # 1) auditoría del intervalo
+        cur.execute("""
+          INSERT INTO label_intervals (session_id, start_ts, end_ts, label, reason)
+          VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s)
+        """, (payload.session_id, start_ts, end_ts, str(payload.label), "manual"))
+
+        # 2) aplicar etiqueta por "centro" de la ventana
+        cur.execute("""
+          UPDATE windows
+             SET etiqueta = %s
+           WHERE session_id = %s
+             AND (start_time + (end_time - start_time)/2)
+                 BETWEEN to_timestamp(%s) AND to_timestamp(%s)
+        """, (str(payload.label), payload.session_id, start_ts, end_ts))
+        matched = cur.rowcount
+
+    return {
+        "ok": True,
+        "matched_windows": int(matched),
+        "interval": {"start": start_ts, "end": end_ts}
+    }

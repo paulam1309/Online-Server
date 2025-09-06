@@ -19,11 +19,11 @@ from collections import deque
 
 """**Variables para definir las reglas**"""
 
-MIN_CONF = 0.995         # umbral de confianza
-N_CONSEC = 1            # ventanas consecutivas por debajo del umbral
-COOLDOWN_S = 3          # no preguntar de nuevo antes de 60 s
-MAX_ASKS_PER_H = 100       # máximo 4 solicitudes por hora
-KEEP_ALIVE_S = 5    # pedir etiqueta si no hemos recibido una en 5 min
+MIN_CONF = 0.75         # umbral de confianza
+N_CONSEC = 3           # ventanas consecutivas por debajo del umbral
+COOLDOWN_S = 60          # no preguntar de nuevo antes de 60 s
+MAX_ASKS_PER_H = 4     # máximo 4 solicitudes por hora
+KEEP_ALIVE_S = 5*60    # pedir etiqueta si no hemos recibido una en 5 min
 
 """**Estado por sesión**"""
 
