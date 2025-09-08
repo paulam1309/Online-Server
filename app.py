@@ -26,13 +26,19 @@ from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-# arriba, junto a tus imports
+from datetime import timezone
 
 """**CONEXIÓN CON CON LA BASE DE DATOS**"""
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 def get_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+"""**Función de tiempos**"""
+
+def _to_utc(dt):
+    # si viene sin tz, asúmelo en UTC
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 """**CARGA DE ARCHIVOS NECESARIOS**"""
 
@@ -166,8 +172,8 @@ def predict_by_window(req: PredictByWindowReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    st = req.start_ts.astimezone(timezone.utc)
-    et = req.end_ts.astimezone(timezone.utc)
+    st = _to_utc(req.start_ts).astimezone(timezone.utc)
+    et = _to_utc(req.end_ts).astimezone(timezone.utc)
     if et <= st:
         raise HTTPException(400, "end_ts debe ser > start_ts")
 
@@ -180,7 +186,7 @@ def post_label(req: LabelReq):
             """,
             (req.session_id, st, et, req.label, req.reason, req.id_usuario),
         )
-        interval_id = cur.fetchone()["id"]
+        interval_id = cur.fetchone()[0]
 
         cur.execute(
             """
@@ -195,7 +201,7 @@ def post_label(req: LabelReq):
         )
         conn.commit()
 
-    policy.mark_labeled(req.id_usuario, req.session_id)
+    policy.mark_labeled(req.session_id)
     return {"ok": True, "interval_id": interval_id}
 
 @app.post("/policy/asked")
