@@ -24,6 +24,8 @@ import time
 import policy  # importa el motor de reglas
 import psycopg2
 from psycopg2 import sql
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict
 
 """**CONEXIÓN CON CON LA BASE DE DATOS**"""
 
@@ -49,48 +51,6 @@ try:
 except Exception as e:
     raise RuntimeError(f"No pude cargar el schema en {SCHEMA_PATH}: {e}")
 
-"""**Configuración para insertar cada ventana en /ingest**"""
-
-# Commented out IPython magic to ensure Python compatibility.
-TABLE = "windows"
-USER_COL = "id_usuario"
-
-def insert_window_pg(
-    session_id: str,
-    device_id: str,
-    ts_start: float,
-    ts_end: float,
-    features_row: dict,
-    pred_label: str,
-    conf: float,
-    start_index: int | None = None,
-    end_index: int | None = None,
-    n_muestras: int | None = None,
-    gold_label: str | None = None,
-):
-    feats_json = json.dumps({k: features_row[k] for k in FEATURES})
-    with CONN.cursor() as cur:
-        cur.execute(sql.SQL("""
-            INSERT INTO {tbl} (
-              {user}, session_id, received_at, start_time, end_time,
-              start_index, end_index, n_muestras,
-              activity, etiqueta, features
-            )
-            VALUES (
-#               %s, %s, now(), to_timestamp(%s), to_timestamp(%s),
-#               %s, %s, %s,
-#               %s, %s, %s::jsonb
-            )
-        """).format(
-            tbl=sql.Identifier("windows"),
-            user=sql.Identifier("id_usuario"),
-        ), [
-            device_id, session_id,
-            float(ts_start), float(ts_end),
-            start_index, end_index, n_muestras,
-            str(pred_label), gold_label, feats_json
-        ])
-
 """**Configuraciones para conexión remota**"""
 
 app = FastAPI(title="HAR Online – Inference")
@@ -104,21 +64,87 @@ app.add_middleware(
 
 # Iniciar sesión
 class SessionStart(BaseModel):
-    device_id: str
-    session_id: str
+    id_usuario: int
+    session_id: int
 
 class Window(BaseModel):
-    device_id: str
-    session_id: str
-    ts_start: float
-    ts_end: float
-    features: dict  # {nombre_feature: valor}
+    id_usuario: int
+    session_id: int
+    start_time: datetime
+    end_time: datetime
+    sample_rate_hz: Optional[float] = None
+    sample_count: Optional[int] = None
+    features: Dict[str, float]
 
 # Payload mínimo para marcar etiquetas
 class LabelIn(BaseModel):
-    session_id: str
+    id_usuario: int
+    session_id: int
+    start_ts: datetime
+    end_ts: datetime
     label: str
-    duration_s: int | None = 60   # aquí solo registramos; el aligner vendrá luego
+    reason: str | None = "manual"
+
+"""**Configuración de opciones de tiempo**"""
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _epoch(dt: datetime) -> float:
+    return _as_utc(dt).timestamp()
+
+"""**Configuración para insertar cada ventana en /ingest**"""
+
+# Commented out IPython magic to ensure Python compatibility.
+TABLE = "windows"
+USER_COL = "id_usuario"
+
+def insert_window_pg(
+    session_id: int,
+    id_usuario: int,
+    start_time: datetime,
+    end_time: datetime,
+    features_row: dict,
+    pred_label: str,
+    conf: float,
+    sample_rate_hz: float | None = None,
+    sample_count: int | None = None,
+    start_index: int | None = None,
+    end_index: int | None = None,
+    n_muestras: int | None = None,
+):
+    st = _as_utc(start_time)
+    et = _as_utc(end_time)
+    feats_json = json.dumps({k: features_row[k] for k in FEATURES})
+
+    with CONN.cursor() as cur:
+        cur.execute(sql.SQL("""
+            INSERT INTO {tbl} (
+              {user}, session_id, received_at,
+              start_time, end_time,
+              sample_rate_hz, sample_count,
+              start_index, end_index, n_muestras,
+              activity, etiqueta, features
+            )
+            VALUES (
+#               %s, %s, now(),
+#               %s, %s,
+#               %s, %s,
+#               %s, %s, %s,
+#               %s, NULL, %s::jsonb
+            )
+        """).format(
+            tbl=sql.Identifier(TABLE),
+            user=sql.Identifier(USER_COL),
+        ), [
+            int(id_usuario), int(session_id),
+            st, et,
+            sample_rate_hz, sample_count,
+            start_index, end_index, n_muestras,
+            str(pred_label), feats_json
+        ])
 
 """**Gets**
 
@@ -142,10 +168,11 @@ def session_start(s: SessionStart):
     Marca la sesión como recién iniciada y responde con una solicitud de etiqueta inmediata.
     """
     # 1) Resetear estado y marcar “pregunta inicial” pendiente
-    policy.start_session(s.session_id, now_ts=time.time())
+    sid_key = str(s.session_id)          # policy usa string como clave
+    policy.start_session(sid_key, now_ts=time.time())
     # 2) Contabilizar la solicitud (cooldown/presupuesto) y consumir el flag
-    policy.mark_asked(s.session_id, now_ts=time.time())
-    policy.clear_initial(s.session_id)
+    policy.mark_asked(sid_key, now_ts=time.time())
+    policy.clear_initial(sid_key)
 
     return {
         "ask_label": True,
@@ -161,85 +188,89 @@ Se construye del Dataframe y se pasa al .pkl para obtener pred_label + confianza
 
 @app.post("/ingest")
 def ingest(w: Window):
-    # arma DataFrame en el orden exacto del schema
-    row = {}
-    missing = []
+    # 1) Validar features contra schema
+    row, missing = {}, []
     for k in FEATURES:
-        v = w.features.get(k, None)
-        if v is None:
-            missing.append(k)
+        v = w.features.get(k)
+        if v is None: missing.append(k)
         row[k] = v
     if missing:
         raise HTTPException(status_code=400, detail={"missing_features": missing})
 
-    X = pd.DataFrame([row])  # DataFrame para mantener nombres de columnas
+    # 2) Predicción
+    X = pd.DataFrame([row])
     try:
-        proba = MODEL.predict_proba(X)
+        proba = MODEL.predict_proba(X)[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
+        raise HTTPException(500, f"Error en predict_proba: {e}")
 
-    conf = float(proba.max(axis=1)[0])
-    idx  = int(proba.argmax(axis=1)[0])
-    label = CLASSES[idx] if len(CLASSES) else idx
+    idx = int(proba.argmax())
+    conf = float(proba[idx])
+    pred_label = CLASSES[idx] if len(CLASSES) else idx
 
-    #--- Insertar en la BD---
+    # 3) Persistir ventana
     insert_window_pg(
-    session_id=w.session_id,
-    device_id=w.device_id,      # se guarda en id_usuario
-    ts_start=float(w.ts_start),
-    ts_end=float(w.ts_end),
-    features_row=row,
-    pred_label=str(label),
-    conf=float(conf),
-    start_index=None, end_index=None, n_muestras=None,
-    gold_label=None
+        session_id=w.session_id,
+        id_usuario=w.id_usuario,
+        start_time=w.start_time,
+        end_time=w.end_time,
+        features_row=row,
+        pred_label=str(pred_label),
+        conf=conf,
+        sample_rate_hz=w.sample_rate_hz,
+        sample_count=w.sample_count,
+        start_index=None, end_index=None, n_muestras=None,
     )
 
-    # --- Policy Engine ---
-    center_ts = (w.ts_start + w.ts_end) / 2.0
-    ask, reason = policy.should_ask(session_id=w.session_id, conf=conf, now_ts=center_ts)
+    # 4) Policy (usa epoch del centro)
+    center_epoch = (_epoch(w.start_time) + _epoch(w.end_time)) / 2.0
+    sid_key = str(w.session_id)
+    ask, reason = policy.should_ask(sid_key, conf, now_ts=center_epoch)
     if ask:
-        policy.mark_asked(w.session_id, now_ts=center_ts)
+        policy.mark_asked(sid_key, now_ts=center_epoch)
 
-    # Variables  (ventana, pred, conf, ask, reason) para guardar en la BD
     return {
-        "pred_label": str(label),
+        "pred_label": str(pred_label),
         "confianza": conf,
         "ask_label": ask,
         "ask_reason": reason,
         "classes": list(map(str, CLASSES)),
-
     }
 
 """**Endpoint para registrar que el usuario respondió una etiqueta**"""
 
 @app.post("/label")
-def label_endpoint(payload: LabelIn):
-    policy.mark_labeled(payload.session_id, now_ts=time.time())
+def label_endpoint(p: LabelIn):
+    sid_key = str(p.session_id)
 
-    end_ts = float(time.time())
-    dur = float(payload.duration_s or 60)
-    start_ts = end_ts - dur
+    # 1) Definir intervalo
+    if p.start_ts and p.end_ts:
+        s = _as_utc(p.start_ts); e = _as_utc(p.end_ts)
+    else:
+        dur = int(p.duration_s or 60)
+        e = datetime.now(timezone.utc)
+        s = e - timedelta(seconds=dur)
 
     with CONN.cursor() as cur:
-        # 1) auditoría del intervalo
+        # 2) Auditoría en intervalos_label
         cur.execute("""
-          INSERT INTO label_intervals (session_id, start_ts, end_ts, label, reason)
-          VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s)
-        """, (payload.session_id, start_ts, end_ts, str(payload.label), "manual"))
+            INSERT INTO intervalos_label
+              (session_id, start_ts, end_ts, label, reason, user_id, created_at)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, now())
+        """, (int(p.session_id), s, e, str(p.label), p.reason or "manual", int(p.id_usuario)))
 
-        # 2) aplicar etiqueta por "centro" de la ventana
+        # 3) Alinear por centro
         cur.execute("""
-          UPDATE windows
-             SET etiqueta = %s
-           WHERE session_id = %s
-             AND (start_time + (end_time - start_time)/2)
-                 BETWEEN to_timestamp(%s) AND to_timestamp(%s)
-        """, (str(payload.label), payload.session_id, start_ts, end_ts))
+            UPDATE windows
+               SET etiqueta = %s
+             WHERE id_usuario = %s
+               AND session_id = %s
+               AND (start_time + (end_time - start_time)/2)
+                   BETWEEN %s AND %s
+        """, (str(p.label), int(p.id_usuario), int(p.session_id), s, e))
         matched = cur.rowcount
 
-    return {
-        "ok": True,
-        "matched_windows": int(matched),
-        "interval": {"start": start_ts, "end": end_ts}
-    }
+    policy.mark_labeled(sid_key, now_ts=_epoch(e))
+    return {"ok": True, "matched_windows": int(matched),
+            "interval": {"start": s.isoformat(), "end": e.isoformat()}}
