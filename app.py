@@ -186,7 +186,7 @@ def post_label(req: LabelReq):
             """,
             (req.session_id, st, et, req.label, req.reason, req.id_usuario),
         )
-        interval_id = cur.fetchone()[0]
+        interval_id = cur.fetchone()["id"]
 
         cur.execute(
             """
@@ -201,7 +201,8 @@ def post_label(req: LabelReq):
         )
         conn.commit()
 
-    policy.mark_labeled(req.session_id)
+    policy.mark_labeled(req.id_usuario, req.session_id)
+
     return {"ok": True, "interval_id": interval_id}
 
 @app.post("/policy/asked")
