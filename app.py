@@ -18,20 +18,21 @@ LLama a su vez a policy engine en caso de que la confianza baje del 70%
 import os, json, joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
-import time
 import policy  # importa el motor de reglas
 import psycopg2
 from psycopg2 import sql
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict
+from psycopg2.extras import RealDictCursor
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
+# arriba, junto a tus imports
 
 """**CONEXIÓN CON CON LA BASE DE DATOS**"""
 
-DATABASE_URL = os.environ["DATABASE_URL"]  # definida en Render
-CONN = psycopg2.connect(DATABASE_URL)
-CONN.autocommit = True
+DATABASE_URL = os.environ["DATABASE_URL"]
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 """**CARGA DE ARCHIVOS NECESARIOS**"""
 
@@ -62,89 +63,46 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# Iniciar sesión
-class SessionStart(BaseModel):
-    id_usuario: int
-    session_id: int
+"""**Helpers**"""
 
-class Window(BaseModel):
-    id_usuario: int
-    session_id: int
-    start_time: datetime
-    end_time: datetime
-    sample_rate_hz: Optional[float] = None
-    sample_count: Optional[int] = None
-    features: Dict[str, float]
+# --- helpers ---
+def _df_from_window_row(row: Dict[str, Any]) -> pd.DataFrame:
+    if row.get("features"):
+        feats: Dict[str, Any] = row["features"]
+        data = {f: feats.get(f, 0.0) for f in FEATURES}
+    else:
+        data = {f: row.get(f, 0.0) for f in FEATURES}
+    return pd.DataFrame([data], columns=FEATURES)
 
-# Payload mínimo para marcar etiquetas
-class LabelIn(BaseModel):
+def _center_ts(row: Dict[str, Any]) -> float:
+    st, et = row["start_time"], row["end_time"]
+    c = st + (et - st) / 2
+    if c.tzinfo is None:
+        c = c.replace(tzinfo=timezone.utc)
+    return c.timestamp()
+
+"""**Models**"""
+
+class PredictByWindowReq(BaseModel):
+    id: int = Field(..., description="PK de windows")
+
+class LabelReq(BaseModel):
     id_usuario: int
     session_id: int
     start_ts: datetime
     end_ts: datetime
     label: str
-    reason: str | None = "manual"
+    reason: Optional[str] = None
 
-"""**Configuración de opciones de tiempo**"""
+class MarkReq(BaseModel):
+    id_usuario: int
+    session_id: int
+    when: Optional[datetime] = None
 
-def _as_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-def _epoch(dt: datetime) -> float:
-    return _as_utc(dt).timestamp()
-
-"""**Configuración para insertar cada ventana en /ingest**"""
-
-# Commented out IPython magic to ensure Python compatibility.
-TABLE = "windows"
-USER_COL = "id_usuario"
-
-def insert_window_pg(
-    session_id: int,
-    id_usuario: int,
-    start_time: datetime,
-    end_time: datetime,
-    features_row: dict,
-    pred_label: str,
-    conf: float,
-    sample_rate_hz: float | None = None,
-    sample_count: int | None = None,
-    start_index: int | None = None,
-    end_index: int | None = None,
-    n_muestras: int | None = None,
-):
-    st = _as_utc(start_time)
-    et = _as_utc(end_time)
-    feats_json = json.dumps({k: features_row[k] for k in FEATURES})
-
-    with CONN.cursor() as cur:
-        cur.execute(sql.SQL("""
-            INSERT INTO {tbl} (
-              {user}, session_id, received_at,
-              start_time, end_time,
-              sample_rate_hz, sample_count,
-              start_index, end_index, n_muestras,
-              activity, etiqueta, features
-            )
-            VALUES (
-#               %s, %s, now(),
-#               %s, %s,
-#               %s, %s,
-#               %s, %s, %s,
-#               %s, NULL, %s::jsonb
-            )
-        """).format(
-            tbl=sql.Identifier(TABLE),
-            user=sql.Identifier(USER_COL),
-        ), [
-            int(id_usuario), int(session_id),
-            st, et,
-            sample_rate_hz, sample_count,
-            start_index, end_index, n_muestras,
-            str(pred_label), feats_json
-        ])
+class SLPredictReq(BaseModel):
+    id: int
+    actividad: str
+    precision: Optional[float] = None
 
 """**Gets**
 
@@ -160,117 +118,105 @@ def health():
 def schema():
     return {"features": FEATURES, "classes": list(map(str, CLASSES))}
 
-"""**Endpoint para iniciar sesión**"""
-
-@app.post("/session/start")
-def session_start(s: SessionStart):
-    """
-    Marca la sesión como recién iniciada y responde con una solicitud de etiqueta inmediata.
-    """
-    # 1) Resetear estado y marcar “pregunta inicial” pendiente
-    sid_key = str(s.session_id)          # policy usa string como clave
-    policy.start_session(sid_key, now_ts=time.time())
-    # 2) Contabilizar la solicitud (cooldown/presupuesto) y consumir el flag
-    policy.mark_asked(sid_key, now_ts=time.time())
-    policy.clear_initial(sid_key)
-
-    return {
-        "ask_label": True,
-        "ask_reason": "initial",
-        "suggested_duration_s": 60
-    }
-
 """**Endpoint de Ingest**
 
 
 Se construye del Dataframe y se pasa al .pkl para obtener pred_label + confianza
 """
 
-@app.post("/ingest")
-def ingest(w: Window):
-    # 1) Validar features contra schema
-    row, missing = {}, []
-    for k in FEATURES:
-        v = w.features.get(k)
-        if v is None: missing.append(k)
-        row[k] = v
-    if missing:
-        raise HTTPException(status_code=400, detail={"missing_features": missing})
+@app.post("/predict_by_window")
+def predict_by_window(req: PredictByWindowReq):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"id {req.id} no existe")
 
-    # 2) Predicción
-    X = pd.DataFrame([row])
-    try:
+        X = _df_from_window_row(row)
         proba = MODEL.predict_proba(X)[0]
-    except Exception as e:
-        raise HTTPException(500, f"Error en predict_proba: {e}")
+        i_top = int(proba.argmax())
+        pred_label = str(CLASSES[i_top])
+        confianza = float(proba[i_top])
 
-    idx = int(proba.argmax())
-    conf = float(proba[idx])
-    pred_label = CLASSES[idx] if len(CLASSES) else idx
+        id_usuario = int(row["id_usuario"])
+        session_id = int(row["session_id"])
 
-    # 3) Persistir ventana
-    insert_window_pg(
-        session_id=w.session_id,
-        id_usuario=w.id_usuario,
-        start_time=w.start_time,
-        end_time=w.end_time,
-        features_row=row,
-        pred_label=str(pred_label),
-        conf=conf,
-        sample_rate_hz=w.sample_rate_hz,
-        sample_count=w.sample_count,
-        start_index=None, end_index=None, n_muestras=None,
-    )
+        ask, reason = policy.should_ask(
+            id_usuario, session_id, confianza, pred_label=pred_label, now_ts=_center_ts(row)
+        )
+        if ask:
+            policy.mark_asked(id_usuario, session_id)
 
-    # 4) Policy (usa epoch del centro)
-    center_epoch = (_epoch(w.start_time) + _epoch(w.end_time)) / 2.0
-    sid_key = str(w.session_id)
-    ask, reason = policy.should_ask(sid_key, conf, now_ts=center_epoch)
-    if ask:
-        policy.mark_asked(sid_key, now_ts=center_epoch)
+        cur.execute(
+            "UPDATE windows SET pred_label=%s, confianza=%s WHERE id=%s",
+            (pred_label, confianza, req.id),
+        )
+        conn.commit()
 
     return {
-        "pred_label": str(pred_label),
-        "confianza": conf,
-        "ask_label": ask,
-        "ask_reason": reason,
-        "classes": list(map(str, CLASSES)),
-    }
+    "id": req.id,
+    "pred_label": pred_label,
+    "confianza": confianza,
+    "ask_label": ask,
+    "ask_reason": reason,
+    "classes": list(map(str, CLASSES)),
+  }
 
 """**Endpoint para registrar que el usuario respondió una etiqueta**"""
 
 @app.post("/label")
-def label_endpoint(p: LabelIn):
-    sid_key = str(p.session_id)
+def post_label(req: LabelReq):
+    st = req.start_ts.astimezone(timezone.utc)
+    et = req.end_ts.astimezone(timezone.utc)
+    if et <= st:
+        raise HTTPException(400, "end_ts debe ser > start_ts")
 
-    # 1) Definir intervalo
-    if p.start_ts and p.end_ts:
-        s = _as_utc(p.start_ts); e = _as_utc(p.end_ts)
-    else:
-        dur = int(p.duration_s or 60)
-        e = datetime.now(timezone.utc)
-        s = e - timedelta(seconds=dur)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO intervalos_label (session_id, start_ts, end_ts, label, reason, created_at, id_usuario)
+            VALUES (%s,%s,%s,%s,%s,NOW(),%s)
+            RETURNING id
+            """,
+            (req.session_id, st, et, req.label, req.reason, req.id_usuario),
+        )
+        interval_id = cur.fetchone()["id"]
 
-    with CONN.cursor() as cur:
-        # 2) Auditoría en intervalos_label
-        cur.execute("""
-            INSERT INTO intervalos_label
-              (session_id, start_ts, end_ts, label, reason, user_id, created_at)
-            VALUES
-              (%s, %s, %s, %s, %s, %s, now())
-        """, (int(p.session_id), s, e, str(p.label), p.reason or "manual", int(p.id_usuario)))
-
-        # 3) Alinear por centro
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE windows
                SET etiqueta = %s
              WHERE id_usuario = %s
                AND session_id = %s
-               AND (start_time + (end_time - start_time)/2)
-                   BETWEEN %s AND %s
-        """, (str(p.label), int(p.id_usuario), int(p.session_id), s, e))
-        matched = cur.rowcount
+               AND start_time >= %s
+               AND end_time   <= %s
+            """,
+            (req.label, req.id_usuario, req.session_id, st, et),
+        )
+        conn.commit()
 
-    policy.mark_labeled(sid_key, now_ts=_epoch(e))
-    return {"ok": True, "matched_windows": int(matched),
-            "interval": {"start": s.isoformat(), "end": e.isoformat()}}
+    policy.mark_labeled(req.id_usuario, req.session_id)
+    return {"ok": True, "interval_id": interval_id}
+
+@app.post("/policy/asked")
+def policy_mark_asked(req: MarkReq):
+    policy.mark_asked(req.id_usuario, req.session_id, req.when.timestamp() if req.when else None)
+    return {"ok": True}
+
+@app.post("/policy/labeled")
+def policy_mark_labeled(req: MarkReq):
+    policy.mark_labeled(req.id_usuario, req.session_id, req.when.timestamp() if req.when else None)
+    return {"ok": True}
+
+"""**SL**"""
+
+@app.post("/sl/predict")
+def sl_predict(req: SLPredictReq):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM windows WHERE id = %s", (req.id,))
+        if not cur.fetchone():
+            raise HTTPException(404, f"id {req.id} no existe")
+
+        cur.execute("UPDATE windows SET actividad=%s WHERE id=%s", (req.actividad, req.id))
+        conn.commit()
+    return {"ok": True, "id": req.id, "actividad": req.actividad}

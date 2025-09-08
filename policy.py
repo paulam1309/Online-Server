@@ -16,102 +16,100 @@ Motor de reglas encargado de decir cuando solicitar etiqueta al usuario
 import time
 from dataclasses import dataclass, field
 from collections import deque
+from typing import Deque, Tuple, Dict
 
 """**Variables para definir las reglas**"""
 
-MIN_CONF = 0.75         # umbral de confianza
-N_CONSEC = 3           # ventanas consecutivas por debajo del umbral
-COOLDOWN_S = 60          # no preguntar de nuevo antes de 60 s
-MAX_ASKS_PER_H = 4     # máximo 4 solicitudes por hora
-KEEP_ALIVE_S = 5*60    # pedir etiqueta si no hemos recibido una en 5 min
+MIN_CONF = 0.75
+N_CONSEC = 3
+COOLDOWN_S = 60
+MAX_ASKS_PER_H = 4
+KEEP_ALIVE_S = 5 * 60
+
+# Cambio de label
+SWITCH_MIN_CONF = 0.80
+SWITCH_N_CONSEC = 2
 
 """**Estado por sesión**"""
 
 @dataclass
 class SessionState:
-    last_conf: deque = field(default_factory=lambda: deque(maxlen=N_CONSEC))
-    last_ask_ts: float = 0.0
-    asks_in_hour: deque = field(default_factory=deque)  # timestamps de las últimas solicitudes
     last_label_ts: float = 0.0
-    initial_ask_pending: bool = False    # ← Solicitar etiqueta al iniciar
+    last_ask_ts: float = 0.0
+    asks_in_hour: Deque[float] = field(default_factory=lambda: deque(maxlen=64))
+    last_conf: Deque[float] = field(default_factory=lambda: deque(maxlen=N_CONSEC))
 
-STATE: dict[str, SessionState] = {}
+    # tracking de cambio de actividad
+    last_pred_label: str | None = None
+    diff_label_streak: int = 0
 
-"""**Función para iniciar sesión y preguntar etiqueta inicial**"""
-
-def start_session(session_id: str, now_ts: float | None = None) -> None:
-    """Crea/limpia el estado y marca que se debe preguntar inmediatamente."""
-    st = SessionState()
-    st.initial_ask_pending = True
-    STATE[session_id] = st
-
-"""**Función para asegurarse que solo pregunte etiqueta inicial en start_session**"""
-
-def clear_initial(session_id: str) -> None:
-    st = STATE.setdefault(session_id, SessionState())
-    st.initial_ask_pending = False
+# clave: (id_usuario, session_id)
+STATE: Dict[Tuple[int, int], SessionState] = {}
 
 """**Funciones para el motor de reglas**"""
+
+def _key(uid: int, sid: int) -> Tuple[int, int]:
+    return int(uid), int(sid)
 
 def _now(ts: float | None = None) -> float:
     return float(ts if ts is not None else time.time())
 
 def _prune_hour(st: SessionState, now: float) -> None:
-    """Deja solo las solicitudes de los últimos 3600 s."""
     one_hour_ago = now - 3600.0
     while st.asks_in_hour and st.asks_in_hour[0] < one_hour_ago:
         st.asks_in_hour.popleft()
 
-def record_conf(session_id: str, conf: float) -> SessionState:
-    """Guarda la última confianza (para contar consecutivas)."""
-    st = STATE.setdefault(session_id, SessionState())
+def record_conf(uid: int, sid: int, conf: float) -> SessionState:
+    st = STATE.setdefault(_key(uid, sid), SessionState())
     st.last_conf.append(conf)
     return st
 
-def should_ask(session_id: str, conf: float, now_ts: float | None = None) -> tuple[bool, str]:
-    """
-    Devuelve (ask, reason) según las reglas:
-      - cooldown
-      - presupuesto/hora
-      - keep-alive
-      - baja confianza sostenida
-    """
+def record_pred(uid: int, sid: int, label: str, conf: float) -> SessionState:
+    st = STATE.setdefault(_key(uid, sid), SessionState())
+    if st.last_pred_label is not None and label != st.last_pred_label and conf >= SWITCH_MIN_CONF:
+        st.diff_label_streak += 1
+    else:
+        st.diff_label_streak = 0
+    st.last_pred_label = label
+    return st
+
+def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
+               now_ts: float | None = None) -> tuple[bool, str]:
     now = _now(now_ts)
-    st = record_conf(session_id, conf)
+    st = record_conf(uid, sid, conf)
+    if pred_label is not None:
+        st = record_pred(uid, sid, pred_label, conf)
 
-    # PRIORIDAD: al iniciar la sesión, preguntar etiqueta
-    if st.initial_ask_pending:
-        st.initial_ask_pending = False
-        return True, "initial"
-
-    # Cooldown
+    # 1) cooldown
     if now - st.last_ask_ts < COOLDOWN_S:
         return False, "cooldown"
 
-    # Presupuesto por hora
+    # 2) presupuesto/hora
     _prune_hour(st, now)
     if len(st.asks_in_hour) >= MAX_ASKS_PER_H:
         return False, "budget"
 
-    # Keep-alive (no hemos recibido etiqueta recientemente)
+    # 3) cambio de actividad (según predicción)
+    if st.diff_label_streak >= SWITCH_N_CONSEC:
+        return True, "switch"
+
+    # 4) keep-alive
     if st.last_label_ts == 0.0 or (now - st.last_label_ts) >= KEEP_ALIVE_S:
         return True, "keep_alive"
 
-    # Baja confianza sostenida
+    # 5) baja confianza sostenida
     if len(st.last_conf) == N_CONSEC and all(c < MIN_CONF for c in st.last_conf):
         return True, "uncertainty"
 
     return False, "ok"
 
-def mark_asked(session_id: str, now_ts: float | None = None) -> None:
-    """Registra que se hizo la pregunta (para cooldown y presupuesto)."""
+def mark_asked(uid: int, sid: int, now_ts: float | None = None) -> None:
     now = _now(now_ts)
-    st = STATE.setdefault(session_id, SessionState())
+    st = STATE.setdefault(_key(uid, sid), SessionState())
     st.last_ask_ts = now
     _prune_hour(st, now)
     st.asks_in_hour.append(now)
 
-def mark_labeled(session_id: str, now_ts: float | None = None) -> None:
-    """Registra que el usuario dio una etiqueta (resetea keep-alive)."""
-    st = STATE.setdefault(session_id, SessionState())
+def mark_labeled(uid: int, sid: int, now_ts: float | None = None) -> None:
+    st = STATE.setdefault(_key(uid, sid), SessionState())
     st.last_label_ts = _now(now_ts)
