@@ -22,11 +22,9 @@ from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 import policy  # importa el motor de reglas
 import psycopg2
-from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
-from datetime import timezone
+from typing import Optional, Dict, Any
 
 """**CONEXIÓN CON CON LA BASE DE DATOS**"""
 
@@ -87,6 +85,26 @@ def _center_ts(row: Dict[str, Any]) -> float:
         c = c.replace(tzinfo=timezone.utc)
     return c.timestamp()
 
+def _svm_predict_row(row: Dict[str, Any]) -> tuple[str, float]:
+    """Predicción con el SVM calibrado (idéntico a /predict_by_window)."""
+    X = _df_from_window_row(row)
+    proba = MODEL.predict_proba(X)[0]
+    i_top = int(proba.argmax())
+    pred_label = str(CLASSES[i_top])
+    confianza = float(proba[i_top])
+    return pred_label, confianza
+
+def _update_window_preds(cur, win_id: int, pred_label: str, confianza: float) -> None:
+    cur.execute(
+        """
+        UPDATE windows
+           SET pred_label = %s,
+               confianza  = %s
+         WHERE id = %s
+        """,
+        (pred_label, confianza, win_id),
+    )
+
 """**Models**"""
 
 class PredictByWindowReq(BaseModel):
@@ -109,6 +127,11 @@ class SLPredictReq(BaseModel):
     id: int
     actividad: str
     precision: Optional[float] = None
+
+class PredictPendingReq(BaseModel):
+    limit: int = 200
+    id_usuario: Optional[int] = None
+    session_id: Optional[int] = None
 
 """**Gets**
 
@@ -167,6 +190,56 @@ def predict_by_window(req: PredictByWindowReq):
     "ask_reason": reason,
     "classes": list(map(str, CLASSES)),
   }
+
+"""**Endpoint de prediccion pendiente**"""
+
+@app.post("/predict_pending")
+def predict_pending(req: PredictPendingReq):
+    """
+    Procesa ventanas donde pred_label es NULL.
+    Puedes filtrar por id_usuario y/o session_id para un barrido específico.
+    """
+    done = 0
+
+    # Construimos WHERE dinámico
+    where = ["pred_label IS NULL"]
+    params: list[Any] = []
+    if req.id_usuario is not None:
+        where.append("id_usuario = %s")
+        params.append(req.id_usuario)
+    if req.session_id is not None:
+        where.append("session_id = %s")
+        params.append(req.session_id)
+    where_sql = " AND ".join(where)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        # Tomamos un lote estable y lo bloqueamos para evitar colisiones
+        sql_sel = f"""
+            SELECT *
+              FROM windows
+             WHERE {where_sql}
+             ORDER BY id ASC
+             LIMIT %s
+             FOR UPDATE SKIP LOCKED
+        """
+        cur.execute(sql_sel, (*params, req.limit))
+        rows = cur.fetchall()
+
+        for row in rows:
+            win_id = int(row["id"])
+            # si no hay features JSON, _df_from_window_row usará columnas sueltas
+            try:
+                pred, conf = _svm_predict_row(row)
+                _update_window_preds(cur, win_id, pred, conf)
+                done += 1
+            except Exception as e:
+                # si una fila rara rompe, saltamos y seguimos con las demás
+                # (opcional: loggear e)
+                continue
+
+        conn.commit()
+
+    return {"processed": done}
 
 """**Endpoint para registrar que el usuario respondió una etiqueta**"""
 
