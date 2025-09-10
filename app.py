@@ -186,8 +186,8 @@ def predict_by_window(req: PredictByWindowReq):
             # registrar que preguntamos (cooldown, etc.)
             policy.mark_asked(uid, sid, center_ts)
 
-            st = _to_utc(row["start_time"])
-            et = _to_utc(row["end_time"])
+            st = _to_utc(w["start_time"])
+            et = _to_utc(w["end_time"])
 
             with get_conn() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
                 # ¿ya existe una PENDIENTE sin label?
@@ -201,7 +201,7 @@ def predict_by_window(req: PredictByWindowReq):
                     ORDER BY id DESC
                     LIMIT 1
                     """,
-                    (session_id, id_usuario),
+                    (sid, uid),
                 )
                 pend = cur2.fetchone()
 
@@ -216,7 +216,7 @@ def predict_by_window(req: PredictByWindowReq):
                               created_at = NOW()
                         WHERE id = %s
                         """,
-                        (reason, st, et, ask_id),
+                        (ask_reason, st, et, ask_id),
                     )
                 else:
                     # una sola pendiente por sesión → upsert sobre índice parcial
@@ -234,7 +234,7 @@ def predict_by_window(req: PredictByWindowReq):
                               created_at = NOW()
                         RETURNING id
                         """,
-                        (session_id, st, et, reason, id_usuario),
+                        (sid,uid, st, et, ask_reason),
                     )
                     ask_id = cur2.fetchone()["id"]
 
@@ -304,8 +304,8 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    st = _to_utc(w["start_time"])
-    et = _to_utc(w["end_time"])
+    st = _to_utc(req.start_ts)
+    et = _to_utc(req.end_ts)
     if et <= st:
         raise HTTPException(400, "end_ts debe ser > start_ts")
 
