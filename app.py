@@ -190,7 +190,7 @@ def predict_by_window(req: PredictByWindowReq):
             et = _to_utc(w["end_time"])
 
             with get_conn() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
-                # ¿ya existe una PENDIENTE sin label?
+                # ¿ya hay una "pendiente" (label IS NULL) para esta sesión/usuario?
                 cur2.execute(
                     """
                     SELECT id
@@ -210,31 +210,24 @@ def predict_by_window(req: PredictByWindowReq):
                     cur2.execute(
                         """
                         UPDATE intervalos_label
-                          SET reason   = %s,
-                              start_ts = %s,
-                              end_ts   = %s,
+                          SET reason    = %s,
+                              start_ts  = %s,
+                              end_ts    = %s,
                               created_at = NOW()
                         WHERE id = %s
                         """,
                         (ask_reason, st, et, ask_id),
                     )
                 else:
-                    # una sola pendiente por sesión → upsert sobre índice parcial
                     cur2.execute(
                         """
                         INSERT INTO intervalos_label
-                            (session_id, start_ts, end_ts, reason, id_usuario, created_at, label)
+                            (session_id, id_usuario, start_ts, end_ts, reason, created_at, label)
                         VALUES
                             (%s, %s, %s, %s, %s, NOW(), NULL)
-                        ON CONFLICT ON CONSTRAINT ux_intervals_sid_pending DO UPDATE
-                          SET reason     = EXCLUDED.reason,
-                              start_ts   = LEAST(intervalos_label.start_ts, EXCLUDED.start_ts),
-                              end_ts     = GREATEST(intervalos_label.end_ts, EXCLUDED.end_ts),
-                              id_usuario = EXCLUDED.id_usuario,
-                              created_at = NOW()
                         RETURNING id
                         """,
-                        (sid, st, et, ask_reason, uid),
+                        (sid, uid, st, et, ask_reason),
                     )
                     ask_id = cur2.fetchone()["id"]
 
