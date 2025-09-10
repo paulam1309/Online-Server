@@ -156,24 +156,23 @@ Se construye del Dataframe y se pasa al .pkl para obtener pred_label + confianza
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
-    # 1) Leer ventana
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # 1) Leer ventana
         cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
-        row = cur.fetchone()
-        if not row:
+        w = cur.fetchone()
+        if not w:
             raise HTTPException(404, f"id {req.id} no existe")
 
-        # 2) Predicción SVM calibrado
-        pred_label, confianza = _svm_predict_row(row)
+        # 2) Predicción
+        pred_label, confianza = _svm_predict_row(w)
 
-        id_usuario = int(row["id_usuario"])
-        session_id = int(row["session_id"])
-        center_ts = _center_ts(row)
+        uid = int(w["id_usuario"])
+        sid = int(w["session_id"])
+        center_ts = _center_ts(w)
 
-        # 3) Policy
-        ask, reason = policy.should_ask(
-            id_usuario, session_id, confianza,
-            pred_label=pred_label, now_ts=center_ts
+        # 3) Motor de políticas
+        ask, ask_reason = policy.should_ask(
+            uid, sid, confianza, pred_label=pred_label, now_ts=center_ts
         )
 
         # 4) Persistir predicción en windows
@@ -181,74 +180,72 @@ def predict_by_window(req: PredictByWindowReq):
             "UPDATE windows SET pred_label=%s, confianza=%s WHERE id=%s",
             (pred_label, confianza, req.id),
         )
-        conn.commit()
 
-    ask_id = None
+        ask_id = None
+        if ask:
+            # registrar que preguntamos (cooldown, etc.)
+            policy.mark_asked(uid, sid, center_ts)
 
-    # 5) Si hay que preguntar: registrar asked + crear/actualizar pendiente
-    if ask:
-        policy.mark_asked(id_usuario, session_id, center_ts)
+            st = _to_utc(row["start_time"])
+            et = _to_utc(row["end_time"])
 
-
-        st = _to_utc(row["start_time"])
-        et = _to_utc(row["end_time"])
-
-        with get_conn() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
-            # ¿ya existe una pendiente sin label?
-            cur2.execute(
-                """
-                SELECT id
-                  FROM intervalos_label
-                 WHERE session_id=%s
-                   AND id_usuario=%s
-                   AND label IS NULL
-                 ORDER BY id DESC
-                 LIMIT 1
-                """,
-                (session_id, id_usuario),
-            )
-            pend = cur2.fetchone()
-
-            if pend:
-                ask_id = pend["id"]
+            with get_conn() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+                # ¿ya existe una PENDIENTE sin label?
                 cur2.execute(
                     """
-                    UPDATE intervalos_label
-                       SET reason=%s,
-                           start_ts=%s,
-                           end_ts=%s
-                     WHERE id=%s
+                    SELECT id
+                      FROM intervalos_label
+                    WHERE session_id=%s
+                      AND id_usuario=%s
+                      AND label IS NULL
+                    ORDER BY id DESC
+                    LIMIT 1
                     """,
-                    (reason, st, et, ask_id),
+                    (session_id, id_usuario),
                 )
-            else:
+                pend = cur2.fetchone()
 
-                cur2.execute(
-                    """
-                    INSERT INTO intervalos_label
-                        (session_id, start_ts, end_ts, reason, id_usuario, created_at)
-                    VALUES
-                        (%s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (session_id) DO UPDATE
-                      SET reason     = EXCLUDED.reason,
-                          start_ts   = LEAST(intervalos_label.start_ts, EXCLUDED.start_ts),
-                          end_ts     = GREATEST(intervalos_label.end_ts, EXCLUDED.end_ts),
-                          id_usuario = EXCLUDED.id_usuario
-                    RETURNING id
-                    """,
-                    (session_id, start_ts, end_ts, ask_reason, id_usuario),
-                )
-                ask_id = cur2.fetchone()["id"]
+                if pend:
+                    ask_id = pend["id"]
+                    cur2.execute(
+                        """
+                        UPDATE intervalos_label
+                          SET reason   = %s,
+                              start_ts = %s,
+                              end_ts   = %s,
+                              created_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (reason, st, et, ask_id),
+                    )
+                else:
+                    # una sola pendiente por sesión → upsert sobre índice parcial
+                    cur2.execute(
+                        """
+                        INSERT INTO intervalos_label
+                            (session_id, start_ts, end_ts, reason, id_usuario, created_at, label)
+                        VALUES
+                            (%s, %s, %s, %s, %s, NOW(), NULL)
+                        ON CONFLICT ON CONSTRAINT ux_intervals_sid_pending DO UPDATE
+                          SET reason     = EXCLUDED.reason,
+                              start_ts   = LEAST(intervalos_label.start_ts, EXCLUDED.start_ts),
+                              end_ts     = GREATEST(intervalos_label.end_ts, EXCLUDED.end_ts),
+                              id_usuario = EXCLUDED.id_usuario,
+                              created_at = NOW()
+                        RETURNING id
+                        """,
+                        (session_id, st, et, reason, id_usuario),
+                    )
+                    ask_id = cur2.fetchone()["id"]
 
-            conn2.commit()
+                conn2.commit()
 
-    # 6) Respuesta
     return {
         "id": req.id,
         "pred_label": pred_label,
         "confianza": confianza,
         "ask_label": ask,
-        "ask_reason": reason,
+        "ask_reason": ask_reason,
         "ask_id": ask_id,
         "classes": list(map(str, CLASSES)),
     }
@@ -274,7 +271,7 @@ def predict_pending(req: PredictPendingReq):
         params.append(req.session_id)
     where_sql = " AND ".join(where)
 
-    with get_conn() as conn, conn.cursor() as cur:
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Tomamos un lote estable y lo bloqueamos para evitar colisiones
         sql_sel = f"""
             SELECT *
@@ -307,29 +304,29 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    st = req.start_ts.astimezone(timezone.utc)
-    et = req.end_ts.astimezone(timezone.utc)
+    st = _to_utc(w["start_time"])
+    et = _to_utc(w["end_time"])
     if et <= st:
         raise HTTPException(400, "end_ts debe ser > start_ts")
 
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         if req.pending_id:
-            # Actualiza la fila pendiente concreta
             cur.execute(
                 """
                 UPDATE intervalos_label
-                   SET label=%s,
-                       start_ts=%s,
-                       end_ts=%s,
-                       reason=COALESCE(%s, reason),
-                       duracion = EXTRACT(EPOCH FROM (%s - %s))::int
-                 WHERE id=%s AND id_usuario=%s AND session_id=%s
+                  SET label=%s,
+                      start_ts=%s,
+                      end_ts=%s,
+                      reason=COALESCE(%s, reason),
+                      duracion = EXTRACT(EPOCH FROM (%s - %s))::int
+                WHERE id=%s AND id_usuario=%s AND session_id=%s
                 """,
                 (req.label, st, et, req.reason, et, st,
-                 req.pending_id, req.id_usuario, req.session_id),
+                req.pending_id, req.id_usuario, req.session_id),
             )
-            # Si no tocó ninguna fila, cae al flujo alterno
-            if cur.rowcount == 0:
+            if cur.rowcount > 0:
+                interval_id = req.pending_id   # <-- añade esto
+            else:
                 req.pending_id = None
 
         if not req.pending_id:
