@@ -20,14 +20,14 @@ from typing import Deque, Tuple, Dict
 
 """**Variables para definir las reglas**"""
 
-MIN_CONF = 0.75
+MIN_CONF = 0.97
 N_CONSEC = 3
-COOLDOWN_S = 60
-MAX_ASKS_PER_H = 4
-KEEP_ALIVE_S = 5 * 60
+COOLDOWN_S = 2
+MAX_ASKS_PER_H = 10
+KEEP_ALIVE_S = 10
 
 # Cambio de label
-SWITCH_MIN_CONF = 0.80
+SWITCH_MIN_CONF = 0.85
 SWITCH_N_CONSEC = 2
 
 """**Estado por sesión**"""
