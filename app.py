@@ -117,6 +117,7 @@ class LabelReq(BaseModel):
     end_ts: datetime
     label: str
     reason: Optional[str] = None
+    pending_id: int | None = None
 
 class MarkReq(BaseModel):
     id_usuario: int
@@ -155,41 +156,94 @@ Se construye del Dataframe y se pasa al .pkl para obtener pred_label + confianza
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
-    with get_conn() as conn, conn.cursor() as cur:
+    # 1) Leer ventana
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, f"id {req.id} no existe")
 
-        X = _df_from_window_row(row)
-        proba = MODEL.predict_proba(X)[0]
-        i_top = int(proba.argmax())
-        pred_label = str(CLASSES[i_top])
-        confianza = float(proba[i_top])
+        # 2) Predicción SVM calibrado
+        pred_label, confianza = _svm_predict_row(row)
 
         id_usuario = int(row["id_usuario"])
         session_id = int(row["session_id"])
+        center_ts = _center_ts(row)
 
+        # 3) Policy
         ask, reason = policy.should_ask(
-            id_usuario, session_id, confianza, pred_label=pred_label, now_ts=_center_ts(row)
+            id_usuario, session_id, confianza,
+            pred_label=pred_label, now_ts=center_ts
         )
-        if ask:
-            policy.mark_asked(id_usuario, session_id)
 
+        # 4) Persistir predicción en windows
         cur.execute(
             "UPDATE windows SET pred_label=%s, confianza=%s WHERE id=%s",
             (pred_label, confianza, req.id),
         )
         conn.commit()
 
+    ask_id = None
+
+    # 5) Si hay que preguntar: registrar asked + crear/actualizar pendiente
+    if ask:
+        policy.mark_asked(id_usuario, session_id)
+
+        st = _to_utc(row["start_time"])
+        et = _to_utc(row["end_time"])
+
+        with get_conn() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+            # ¿ya existe una pendiente sin label?
+            cur2.execute(
+                """
+                SELECT id
+                  FROM intervalos_label
+                 WHERE session_id=%s
+                   AND id_usuario=%s
+                   AND label IS NULL
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (session_id, id_usuario),
+            )
+            pend = cur2.fetchone()
+
+            if pend:
+                ask_id = pend["id"]
+                cur2.execute(
+                    """
+                    UPDATE intervalos_label
+                       SET reason=%s,
+                           start_ts=%s,
+                           end_ts=%s
+                     WHERE id=%s
+                    """,
+                    (reason, st, et, ask_id),
+                )
+            else:
+                cur2.execute(
+                    """
+                    INSERT INTO intervalos_label
+                        (session_id, id_usuario, start_ts, end_ts, reason)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (session_id, id_usuario, st, et, reason),
+                )
+                ask_id = cur2.fetchone()["id"]
+
+            conn2.commit()
+
+    # 6) Respuesta
     return {
-    "id": req.id,
-    "pred_label": pred_label,
-    "confianza": confianza,
-    "ask_label": ask,
-    "ask_reason": reason,
-    "classes": list(map(str, CLASSES)),
-  }
+        "id": req.id,
+        "pred_label": pred_label,
+        "confianza": confianza,
+        "ask_label": ask,
+        "ask_reason": reason,
+        "ask_id": ask_id,
+        "classes": list(map(str, CLASSES)),
+    }
 
 """**Endpoint de prediccion pendiente**"""
 
@@ -245,37 +299,73 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    st = _to_utc(req.start_ts).astimezone(timezone.utc)
-    et = _to_utc(req.end_ts).astimezone(timezone.utc)
+    st = req.start_ts.astimezone(timezone.utc)
+    et = req.end_ts.astimezone(timezone.utc)
     if et <= st:
         raise HTTPException(400, "end_ts debe ser > start_ts")
 
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO intervalos_label (session_id, start_ts, end_ts, label, reason, created_at, id_usuario)
-            VALUES (%s,%s,%s,%s,%s,NOW(),%s)
-            RETURNING id
-            """,
-            (req.session_id, st, et, req.label, req.reason, req.id_usuario),
-        )
-        interval_id = cur.fetchone()["id"]
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if req.pending_id:
+            # Actualiza la fila pendiente concreta
+            cur.execute(
+                """
+                UPDATE intervalos_label
+                   SET label=%s,
+                       start_ts=%s,
+                       end_ts=%s,
+                       reason=COALESCE(%s, reason),
+                       duracion = EXTRACT(EPOCH FROM (%s - %s))::int
+                 WHERE id=%s AND id_usuario=%s AND session_id=%s
+                """,
+                (req.label, st, et, req.reason, et, st,
+                 req.pending_id, req.id_usuario, req.session_id),
+            )
+            # Si no tocó ninguna fila, cae al flujo alterno
+            if cur.rowcount == 0:
+                req.pending_id = None
 
-        cur.execute(
-            """
-            UPDATE windows
-               SET etiqueta = %s
-             WHERE id_usuario = %s
-               AND session_id = %s
-               AND start_time >= %s
-               AND end_time   <= %s
-            """,
-            (req.label, req.id_usuario, req.session_id, st, et),
-        )
+        if not req.pending_id:
+            # Busca la última “pendiente” de esa sesión/usuario
+            cur.execute(
+                """
+                SELECT id FROM intervalos_label
+                 WHERE id_usuario=%s AND session_id=%s AND label IS NULL
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (req.id_usuario, req.session_id),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    """
+                    UPDATE intervalos_label
+                       SET label=%s,
+                           start_ts=%s,
+                           end_ts=%s,
+                           reason=COALESCE(%s, reason),
+                           duracion = EXTRACT(EPOCH FROM (%s - %s))::int
+                     WHERE id=%s
+                    """,
+                    (req.label, st, et, req.reason, et, st, row["id"]),
+                )
+                interval_id = row["id"]
+            else:
+                # No había pendiente → inserta normal (por compatibilidad)
+                cur.execute(
+                    """
+                    INSERT INTO intervalos_label
+                        (session_id, start_ts, end_ts, label, reason, id_usuario, duracion)
+                    VALUES (%s,%s,%s,%s,%s,%s, EXTRACT(EPOCH FROM (%s - %s))::int)
+                    RETURNING id
+                    """,
+                    (req.session_id, st, et, req.label, req.reason,
+                     req.id_usuario, et, st),
+                )
+                interval_id = cur.fetchone()["id"]
+
         conn.commit()
 
     policy.mark_labeled(req.id_usuario, req.session_id)
-
     return {"ok": True, "interval_id": interval_id}
 
 @app.post("/policy/asked")
