@@ -234,7 +234,7 @@ def predict_by_window(req: PredictByWindowReq):
                               created_at = NOW()
                         RETURNING id
                         """,
-                        (sid,uid, st, et, ask_reason),
+                        (sid, st, et, ask_reason, uid),
                     )
                     ask_id = cur2.fetchone()["id"]
 
