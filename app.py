@@ -187,7 +187,8 @@ def predict_by_window(req: PredictByWindowReq):
 
     # 5) Si hay que preguntar: registrar asked + crear/actualizar pendiente
     if ask:
-        policy.mark_asked(id_usuario, session_id)
+        policy.mark_asked(id_usuario, session_id, center_ts)
+
 
         st = _to_utc(row["start_time"])
         et = _to_utc(row["end_time"])
@@ -364,8 +365,7 @@ def post_label(req: LabelReq):
                 interval_id = cur.fetchone()["id"]
 
         conn.commit()
-
-    policy.mark_labeled(req.id_usuario, req.session_id)
+    policy.mark_labeled(req.id_usuario, req.session_id, et.timestamp())
     return {"ok": True, "interval_id": interval_id}
 
 @app.post("/policy/asked")
