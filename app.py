@@ -222,14 +222,21 @@ def predict_by_window(req: PredictByWindowReq):
                     (reason, st, et, ask_id),
                 )
             else:
+
                 cur2.execute(
                     """
                     INSERT INTO intervalos_label
-                        (session_id, id_usuario, start_ts, end_ts, reason)
-                    VALUES (%s, %s, %s, %s, %s)
+                        (session_id, start_ts, end_ts, reason, id_usuario, created_at)
+                    VALUES
+                        (%s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (session_id) DO UPDATE
+                      SET reason     = EXCLUDED.reason,
+                          start_ts   = LEAST(intervalos_label.start_ts, EXCLUDED.start_ts),
+                          end_ts     = GREATEST(intervalos_label.end_ts, EXCLUDED.end_ts),
+                          id_usuario = EXCLUDED.id_usuario
                     RETURNING id
                     """,
-                    (session_id, id_usuario, st, et, reason),
+                    (session_id, start_ts, end_ts, ask_reason, id_usuario),
                 )
                 ask_id = cur2.fetchone()["id"]
 

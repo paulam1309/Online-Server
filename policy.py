@@ -16,13 +16,13 @@ Motor de reglas encargado de decir cuando solicitar etiqueta al usuario
 import time
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Deque, Tuple, Dict
+from typing import Deque, Tuple, Dict, Optional
 
 """**Variables para definir las reglas**"""
 
 MIN_CONF = 0.97
 N_CONSEC = 3
-COOLDOWN_S = 2
+COOLDOWN_S = 15
 MAX_ASKS_PER_H = 10
 KEEP_ALIVE_S = 10
 
@@ -41,7 +41,10 @@ class SessionState:
 
     # tracking de cambio de actividad
     last_pred_label: str | None = None
-    diff_label_streak: int = 0
+
+     # Swicth: seguimiento del candidato de cambio
+    change_label: str | None = None
+    change_run: int = 0
 
 # clave: (id_usuario, session_id)
 STATE: Dict[Tuple[int, int], SessionState] = {}
@@ -66,10 +69,20 @@ def record_conf(uid: int, sid: int, conf: float) -> SessionState:
 
 def record_pred(uid: int, sid: int, label: str, conf: float) -> SessionState:
     st = STATE.setdefault(_key(uid, sid), SessionState())
-    if st.last_pred_label is not None and label != st.last_pred_label and conf >= SWITCH_MIN_CONF:
-        st.diff_label_streak += 1
-    else:
-        st.diff_label_streak = 0
+
+    if conf >= SWITCH_MIN_CONF:
+        if st.change_label == label:
+            # seguimos viendo el mismo "nuevo" label
+            st.change_run += 1
+        elif st.last_pred_label is not None and label != st.last_pred_label:
+            # detectamos un cambio de label: comenzamos corrida nueva
+            st.change_label = label
+            st.change_run = 1
+        else:
+            # sin cambio o sin suficiente confianza: resetea corrida
+            st.change_label = None
+            st.change_run = 0
+
     st.last_pred_label = label
     return st
 
@@ -80,24 +93,23 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
     if pred_label is not None:
         st = record_pred(uid, sid, pred_label, conf)
 
-    # 1) cooldown
+    # cooldown
     if now - st.last_ask_ts < COOLDOWN_S:
         return False, "cooldown"
 
-    # 2) presupuesto/hora
     _prune_hour(st, now)
     if len(st.asks_in_hour) >= MAX_ASKS_PER_H:
         return False, "budget"
 
-    # 3) cambio de actividad (según predicción)
-    if st.diff_label_streak >= SWITCH_N_CONSEC:
+    # cambio de actividad: si llevamos N ventanas seguidas con el nuevo label
+    if st.change_run >= SWITCH_N_CONSEC:
         return True, "switch"
 
-    # 4) keep-alive
+    # keep-alive
     if st.last_label_ts == 0.0 or (now - st.last_label_ts) >= KEEP_ALIVE_S:
         return True, "keep_alive"
 
-    # 5) baja confianza sostenida
+    # baja confianza sostenida
     if len(st.last_conf) == N_CONSEC and all(c < MIN_CONF for c in st.last_conf):
         return True, "uncertainty"
 
@@ -109,6 +121,9 @@ def mark_asked(uid: int, sid: int, now_ts: float | None = None) -> None:
     st.last_ask_ts = now
     _prune_hour(st, now)
     st.asks_in_hour.append(now)
+    # resetear la corrida de cambio
+    st.change_label = None
+    st.change_run = 0
 
 def mark_labeled(uid: int, sid: int, now_ts: float | None = None) -> None:
     st = STATE.setdefault(_key(uid, sid), SessionState())
