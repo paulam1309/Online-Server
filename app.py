@@ -21,7 +21,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 import policy  # importa el motor de reglas
-import psycopg2 import errors
+import psycopg2
+from psycopg2 import errors
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
