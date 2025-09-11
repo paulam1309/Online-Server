@@ -20,15 +20,14 @@ from typing import Deque, Tuple, Dict, Optional
 
 """**Variables para definir las reglas**"""
 
-MIN_CONF = 0.97
-N_CONSEC = 5
-COOLDOWN_S = 15
-MAX_ASKS_PER_H = 10
-KEEP_ALIVE_S = 2*60
+MIN_CONF       = 0.965     # antes 0.97
+N_CONSEC       = 6
+COOLDOWN_S     = 60        # antes 45
+MAX_ASKS_PER_H = 30
+KEEP_ALIVE_S   = 300       # antes 180
 
-# Cambio de label
-SWITCH_MIN_CONF = 0.85
-SWITCH_N_CONSEC = 2
+SWITCH_MIN_CONF = 0.90
+SWITCH_N_CONSEC = 3
 
 """**Estado por sesión**"""
 
@@ -45,6 +44,9 @@ class SessionState:
      # Swicth: seguimiento del candidato de cambio
     change_label: str | None = None
     change_run: int = 0
+
+     # Última etiqueta confirmada por el usuario
+    last_user_label: str | None = None
 
 # clave: (id_usuario, session_id)
 STATE: Dict[Tuple[int, int], SessionState] = {}
@@ -69,20 +71,17 @@ def record_conf(uid: int, sid: int, conf: float) -> SessionState:
 
 def record_pred(uid: int, sid: int, label: str, conf: float) -> SessionState:
     st = STATE.setdefault(_key(uid, sid), SessionState())
-
-    if conf >= SWITCH_MIN_CONF:
-        if st.change_label == label:
-            # seguimos viendo el mismo "nuevo" label
-            st.change_run += 1
-        elif st.last_pred_label is not None and label != st.last_pred_label:
-            # detectamos un cambio de label: comenzamos corrida nueva
-            st.change_label = label
-            st.change_run = 1
+    # mide cambio vs la ULTIMA etiqueta del usuario (no vs pred anterior)
+    if st.last_user_label and conf >= SWITCH_MIN_CONF:
+        if label != st.last_user_label:
+            if st.change_label == label:
+                st.change_run += 1
+            else:
+                st.change_label = label
+                st.change_run = 1
         else:
-            # sin cambio o sin suficiente confianza: resetea corrida
             st.change_label = None
             st.change_run = 0
-
     st.last_pred_label = label
     return st
 
@@ -93,25 +92,24 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
     if pred_label is not None:
         st = record_pred(uid, sid, pred_label, conf)
 
-    # cooldown
+    # anti-spam
     if now - st.last_ask_ts < COOLDOWN_S:
         return False, "cooldown"
-
     _prune_hour(st, now)
     if len(st.asks_in_hour) >= MAX_ASKS_PER_H:
         return False, "budget"
 
-    # cambio de actividad: si llevamos N ventanas seguidas con el nuevo label
+    # 1) cambio real
     if st.change_run >= SWITCH_N_CONSEC:
         return True, "switch"
 
-    # keep-alive
-    if st.last_label_ts == 0.0 or (now - st.last_label_ts) >= KEEP_ALIVE_S:
-        return True, "keep_alive"
-
-    # baja confianza sostenida
+    # 2) baja confianza sostenida
     if len(st.last_conf) == N_CONSEC and all(c < MIN_CONF for c in st.last_conf):
         return True, "uncertainty"
+
+    # 3) keep-alive
+    if st.last_label_ts == 0.0 or (now - st.last_label_ts) >= KEEP_ALIVE_S:
+        return True, "keep_alive"
 
     return False, "ok"
 
@@ -125,6 +123,10 @@ def mark_asked(uid: int, sid: int, now_ts: float | None = None) -> None:
     st.change_label = None
     st.change_run = 0
 
-def mark_labeled(uid: int, sid: int, now_ts: float | None = None) -> None:
+def mark_labeled(uid: int, sid: int, now_ts: float | None = None, label: str | None = None) -> None:
     st = STATE.setdefault(_key(uid, sid), SessionState())
     st.last_label_ts = _now(now_ts)
+    if label:
+        st.last_user_label = label
+        st.change_label = None
+        st.change_run = 0

@@ -304,72 +304,56 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    st = _to_utc(req.start_ts)
-    et = _to_utc(req.end_ts)
+    st = req.start_ts.astimezone(timezone.utc)
+    et = req.end_ts.astimezone(timezone.utc)
     if et <= st:
         raise HTTPException(400, "end_ts debe ser > start_ts")
 
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        if req.pending_id:
-            cur.execute(
-                """
+        # 1) Cerrar/crear intervalo (si hay pendiente, actualízalo; si no, inserta)
+        cur.execute("""
+            SELECT id
+              FROM intervalos_label
+             WHERE id_usuario = %s
+               AND session_id  = %s
+               AND label IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1
+             FOR UPDATE
+        """, (req.id_usuario, req.session_id))
+        pend = cur.fetchone()
+
+        if pend:
+            cur.execute("""
                 UPDATE intervalos_label
-                  SET label=%s,
-                      start_ts=%s,
-                      end_ts=%s,
-                      reason=COALESCE(%s, reason),
-                      duracion = EXTRACT(EPOCH FROM (%s - %s))::int
-                WHERE id=%s AND id_usuario=%s AND session_id=%s
-                """,
-                (req.label, st, et, req.reason, et, st,
-                req.pending_id, req.id_usuario, req.session_id),
-            )
-            if cur.rowcount > 0:
-                interval_id = req.pending_id   # <-- añade esto
-            else:
-                req.pending_id = None
+                   SET label=%s, reason=%s, start_ts=%s, end_ts=%s, created_at=NOW()
+                 WHERE id=%s
+                RETURNING id
+            """, (req.label, req.reason, st, et, pend["id"]))
+            interval_id = cur.fetchone()["id"]
+        else:
+            cur.execute("""
+                INSERT INTO intervalos_label
+                    (start_ts, end_ts, label, reason, created_at, id_usuario, session_id)
+                VALUES (%s, %s, %s, %s, NOW(), %s, %s)
+                RETURNING id
+            """, (st, et, req.label, req.reason, req.id_usuario, req.session_id))
+            interval_id = cur.fetchone()["id"]
 
-        if not req.pending_id:
-            # Busca la última “pendiente” de esa sesión/usuario
-            cur.execute(
-                """
-                SELECT id FROM intervalos_label
-                 WHERE id_usuario=%s AND session_id=%s AND label IS NULL
-                 ORDER BY id DESC LIMIT 1
-                """,
-                (req.id_usuario, req.session_id),
-            )
-            row = cur.fetchone()
-            if row:
-                cur.execute(
-                    """
-                    UPDATE intervalos_label
-                       SET label=%s,
-                           start_ts=%s,
-                           end_ts=%s,
-                           reason=COALESCE(%s, reason),
-                           duracion = EXTRACT(EPOCH FROM (%s - %s))::int
-                     WHERE id=%s
-                    """,
-                    (req.label, st, et, req.reason, et, st, row["id"]),
-                )
-                interval_id = row["id"]
-            else:
-                # No había pendiente → inserta normal (por compatibilidad)
-                cur.execute(
-                    """
-                    INSERT INTO intervalos_label
-                        (session_id, start_ts, end_ts, label, reason, id_usuario, duracion)
-                    VALUES (%s,%s,%s,%s,%s,%s, EXTRACT(EPOCH FROM (%s - %s))::int)
-                    RETURNING id
-                    """,
-                    (req.session_id, st, et, req.label, req.reason,
-                     req.id_usuario, et, st),
-                )
-                interval_id = cur.fetchone()["id"]
+        # 2) 👇 AQUÍ va tu UPDATE para propagar la etiqueta a windows
+        cur.execute("""
+            UPDATE windows
+               SET etiqueta = %s
+             WHERE id_usuario = %s
+               AND session_id  = %s
+               AND start_time < %s
+               AND end_time   > %s
+        """, (req.label, req.id_usuario, req.session_id, et, st))
 
+        # 3) Commit en la misma transacción
         conn.commit()
-    policy.mark_labeled(req.id_usuario, req.session_id, et.timestamp())
+
+    policy.mark_labeled(req.id_usuario, req.session_id, et.timestamp(), req.label)
     return {"ok": True, "interval_id": interval_id}
 
 @app.post("/policy/asked")
