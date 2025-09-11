@@ -186,7 +186,7 @@ def predict_by_window(req: PredictByWindowReq):
 
         # 5) Si hay que preguntar: marcar y luego UPDATE-then-INSERT
         if ask:
-            policy.mark_asked(uid, sid, center_ts)
+            policy.mark_asked(uid, sid, center_ts, ask_reason)
 
             st = w["start_time"]; et = w["end_time"]
             if st.tzinfo is None: st = st.replace(tzinfo=timezone.utc)
@@ -322,17 +322,7 @@ def post_label(req: LabelReq):
             """, (st, et, req.label, req.reason, req.id_usuario, req.session_id))
             interval_id = cur.fetchone()["id"]
 
-        # 2) 👇 AQUÍ va tu UPDATE para propagar la etiqueta a windows
-        cur.execute("""
-            UPDATE windows
-               SET etiqueta = %s
-             WHERE id_usuario = %s
-               AND session_id  = %s
-               AND start_time < %s
-               AND end_time   > %s
-        """, (req.label, req.id_usuario, req.session_id, et, st))
-
-        # 3) Commit en la misma transacción
+        # 2) Commit en la misma transacción
         conn.commit()
 
     policy.mark_labeled(req.id_usuario, req.session_id, et.timestamp(), req.label)

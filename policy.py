@@ -20,14 +20,16 @@ from typing import Deque, Tuple, Dict, Optional
 
 """**Variables para definir las reglas**"""
 
-MIN_CONF       = 0.965     # antes 0.97
-N_CONSEC       = 6
-COOLDOWN_S     = 60        # antes 45
-MAX_ASKS_PER_H = 30
-KEEP_ALIVE_S   = 300       # antes 180
+# --- UMBRALES ---
+MIN_CONF = 0.85         # incertidumbre sostenida
+N_CONSEC = 5            # cuántas seguidas < MIN_CONF
 
-SWITCH_MIN_CONF = 0.90
-SWITCH_N_CONSEC = 3
+SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
+SWITCH_N_CONSEC = 10    # cuántas ventanas consecutivas con la NUEVA pred_label
+
+COOLDOWN_S = 120        # anti-spam general entre preguntas
+KEEP_ALIVE_S = 300      # 5 min
+MAX_ASKS_PER_H = 20     # presupuesto/hora
 
 """**Estado por sesión**"""
 
@@ -40,6 +42,7 @@ class SessionState:
 
     # tracking de cambio de actividad
     last_pred_label: str | None = None
+    mode_label: str | None = None             # <- NUEVO: "estado estable" actual del modelo
 
      # Swicth: seguimiento del candidato de cambio
     change_label: str | None = None
@@ -47,7 +50,7 @@ class SessionState:
 
      # Última etiqueta confirmada por el usuario
     last_user_label: str | None = None
-
+    last_keepalive_ts: float = 0.0
 # clave: (id_usuario, session_id)
 STATE: Dict[Tuple[int, int], SessionState] = {}
 
@@ -71,17 +74,25 @@ def record_conf(uid: int, sid: int, conf: float) -> SessionState:
 
 def record_pred(uid: int, sid: int, label: str, conf: float) -> SessionState:
     st = STATE.setdefault(_key(uid, sid), SessionState())
-    # mide cambio vs la ULTIMA etiqueta del usuario (no vs pred anterior)
-    if st.last_user_label and conf >= SWITCH_MIN_CONF:
-        if label != st.last_user_label:
+
+    if conf >= SWITCH_MIN_CONF:
+        if st.mode_label is None:
+            # Primera vez: asumimos este label como el "modo" estable
+            st.mode_label = label
+            st.change_label = None
+            st.change_run = 0
+        elif label == st.mode_label:
+            # Sigue igual → sin candidato
+            st.change_label = None
+            st.change_run = 0
+        else:
+            # Candidato de cambio: mismo label nuevo consecutivo => aumenta racha
             if st.change_label == label:
                 st.change_run += 1
             else:
                 st.change_label = label
                 st.change_run = 1
-        else:
-            st.change_label = None
-            st.change_run = 0
+
     st.last_pred_label = label
     return st
 
@@ -93,9 +104,10 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
         st = record_pred(uid, sid, pred_label, conf)
 
     # anti-spam
-    if now - st.last_ask_ts < COOLDOWN_S:
+    if now - st.last_keepalive_ts < KEEP_ALIVE_S:
         return False, "cooldown"
     _prune_hour(st, now)
+
     if len(st.asks_in_hour) >= MAX_ASKS_PER_H:
         return False, "budget"
 
@@ -113,20 +125,28 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
 
     return False, "ok"
 
-def mark_asked(uid: int, sid: int, now_ts: float | None = None) -> None:
+def mark_asked(uid: int, sid: int, now_ts: float | None = None, reason: str | None = None) -> None:
     now = _now(now_ts)
     st = STATE.setdefault(_key(uid, sid), SessionState())
     st.last_ask_ts = now
     _prune_hour(st, now)
     st.asks_in_hour.append(now)
-    # resetear la corrida de cambio
-    st.change_label = None
-    st.change_run = 0
+
+    if reason == "keep_alive":
+        st.last_keepalive_ts = now  # <- anti-spam de keep-alive
+
+    if reason == "switch":
+        # Fijamos el nuevo modo al candidato y reseteamos racha
+        if st.change_label:
+            st.mode_label = st.change_label
+        st.change_label = None
+        st.change_run = 0
 
 def mark_labeled(uid: int, sid: int, now_ts: float | None = None, label: str | None = None) -> None:
     st = STATE.setdefault(_key(uid, sid), SessionState())
     st.last_label_ts = _now(now_ts)
     if label:
         st.last_user_label = label
+        st.mode_label = label         # <- alinear el modo con la etiqueta del usuario
         st.change_label = None
         st.change_run = 0
