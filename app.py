@@ -204,7 +204,7 @@ def predict_by_window(req: PredictByWindowReq):
                     (id_usuario, session_id, start_ts, end_ts, label,  reason,     created_at)
                 VALUES
                     (%s,         %s,          %s,        %s,     NULL,  %s,         NOW())
-                ON CONFLICT ON CONSTRAINT ux_intervals_sid_pending
+                ON CONFLICT (id_usuario, session_id)
                 DO UPDATE SET
                     reason     = EXCLUDED.reason,
                     start_ts   = EXCLUDED.start_ts,
