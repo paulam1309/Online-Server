@@ -184,37 +184,42 @@ def predict_by_window(req: PredictByWindowReq):
 
         ask_id = None
 
-        # 5) Si hay que preguntar: marcar y UPSERT de la fila pendiente
+        # 5) Si hay que preguntar: marcar y luego UPDATE-then-INSERT
         if ask:
             policy.mark_asked(uid, sid, center_ts)
 
-            # rango sugerido alrededor de la ventana actual
-            st = w["start_time"]
-            et = w["end_time"]
-            # normaliza a UTC por si vienen naive
+            st = w["start_time"]; et = w["end_time"]
             if st.tzinfo is None: st = st.replace(tzinfo=timezone.utc)
-            else:                  st = st.astimezone(timezone.utc)
+            else:                 st = st.astimezone(timezone.utc)
             if et.tzinfo is None: et = et.replace(tzinfo=timezone.utc)
-            else:                  et = et.astimezone(timezone.utc)
+            else:                 et = et.astimezone(timezone.utc)
 
-            # UPSERT: una sola "pendiente" (label NULL) por (id_usuario, session_id)
-            cur.execute(
-                """
-                INSERT INTO intervalos_label
-                    (id_usuario, session_id, start_ts, end_ts, label,  reason,     created_at)
-                VALUES
-                    (%s,         %s,          %s,        %s,     NULL,  %s,         NOW())
-                ON CONFLICT (id_usuario, session_id)
-                DO UPDATE SET
-                    reason     = EXCLUDED.reason,
-                    start_ts   = EXCLUDED.start_ts,
-                    end_ts     = EXCLUDED.end_ts,
-                    created_at = NOW()
+            # 5.1) Intento de UPDATE a la fila pendiente de esa sesión (label IS NULL)
+            cur.execute("""
+                UPDATE intervalos_label
+                  SET reason=%s,
+                      start_ts=%s,
+                      end_ts=%s,
+                      created_at=NOW()
+                WHERE id_usuario=%s
+                  AND session_id=%s
+                  AND label IS NULL
                 RETURNING id
-                """,
-                (uid, sid, st, et, ask_reason),
-            )
-            ask_id = cur.fetchone()["id"]
+            """, (ask_reason, st, et, uid, sid))
+            row_upd = cur.fetchone()
+
+            if row_upd:
+                ask_id = row_upd["id"]
+            else:
+                # 5.2) Si no existía pendiente, INSERT nueva pendiente (label NULL)
+                cur.execute("""
+                    INSERT INTO intervalos_label
+                        (id_usuario, session_id, start_ts, end_ts, label, reason, created_at)
+                    VALUES (%s, %s, %s, %s, NULL, %s, NOW())
+                    RETURNING id
+                """, (uid, sid, st, et, ask_reason))
+                ask_id = cur.fetchone()["id"]
+
 
         # 6) Commit al salir del with si no hubo excepción
     return {
