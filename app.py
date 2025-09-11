@@ -184,62 +184,39 @@ def predict_by_window(req: PredictByWindowReq):
 
         ask_id = None
 
+        # 5) Si hay que preguntar: marcar y UPSERT de la fila pendiente
         if ask:
-            # registrar que preguntamos (cooldown, etc.) en memoria de policy
             policy.mark_asked(uid, sid, center_ts)
 
-            st = _to_utc(w["start_time"])
-            et = _to_utc(w["end_time"])
+            # rango sugerido alrededor de la ventana actual
+            st = w["start_time"]
+            et = w["end_time"]
+            # normaliza a UTC por si vienen naive
+            if st.tzinfo is None: st = st.replace(tzinfo=timezone.utc)
+            else:                  st = st.astimezone(timezone.utc)
+            if et.tzinfo is None: et = et.replace(tzinfo=timezone.utc)
+            else:                  et = et.astimezone(timezone.utc)
 
-            # 5) “Fila pendiente por sesión”
-            # Usa el MISMO conn para que todo quede en una sola transacción.
-            cur2 = conn.cursor(cursor_factory=RealDictCursor)
-
-            # Intentar tomar la fila pendiente (label IS NULL) y bloquearla
-            cur2.execute(
+            # UPSERT: una sola "pendiente" (label NULL) por (id_usuario, session_id)
+            cur.execute(
                 """
-                SELECT id
-                  FROM intervalos_label
-                 WHERE session_id = %s
-                   AND id_usuario = %s
-                   AND label IS NULL
-                 ORDER BY id DESC
-                 LIMIT 1
-                 FOR UPDATE
+                INSERT INTO intervalos_label
+                    (id_usuario, session_id, start_ts, end_ts, label,  reason,     created_at)
+                VALUES
+                    (%s,         %s,          %s,        %s,     NULL,  %s,         NOW())
+                ON CONFLICT ON CONSTRAINT ux_intervals_sid_pending
+                DO UPDATE SET
+                    reason     = EXCLUDED.reason,
+                    start_ts   = EXCLUDED.start_ts,
+                    end_ts     = EXCLUDED.end_ts,
+                    created_at = NOW()
+                RETURNING id
                 """,
-                (sid, uid),
+                (uid, sid, st, et, ask_reason),
             )
-            pend = cur2.fetchone()
+            ask_id = cur.fetchone()["id"]
 
-            if pend:
-                ask_id = pend["id"]
-                # actualiza reason y tiempos
-                cur2.execute(
-                    """
-                    UPDATE intervalos_label
-                       SET reason     = %s,
-                           start_ts   = %s,
-                           end_ts     = %s,
-                           created_at = NOW()
-                     WHERE id = %s
-                    """,
-                    (ask_reason, st, et, ask_id),
-                )
-            else:
-                # crea una sola fila “pendiente” para esa sesión
-                cur2.execute(
-                    """
-                    INSERT INTO intervalos_label
-                        (session_id, id_usuario, start_ts, end_ts, reason, created_at, label)
-                    VALUES
-                        (%s, %s, %s, %s, %s, NOW(), NULL)
-                    RETURNING id
-                    """,
-                    (sid, uid, st, et, ask_reason),
-                )
-                ask_id = cur2.fetchone()["id"]
-
-        # al salir del with conn: si no hubo excepciones, COMMIT
+        # 6) Commit al salir del with si no hubo excepción
     return {
         "id": req.id,
         "pred_label": pred_label,
