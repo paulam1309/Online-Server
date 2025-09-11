@@ -21,10 +21,10 @@ from typing import Deque, Tuple, Dict, Optional
 """**Variables para definir las reglas**"""
 
 MIN_CONF = 0.97
-N_CONSEC = 3
+N_CONSEC = 5
 COOLDOWN_S = 15
 MAX_ASKS_PER_H = 10
-KEEP_ALIVE_S = 10
+KEEP_ALIVE_S = 2*60
 
 # Cambio de label
 SWITCH_MIN_CONF = 0.85

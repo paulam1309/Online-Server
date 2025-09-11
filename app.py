@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 import policy  # importa el motor de reglas
-import psycopg2
+import psycopg2 import errors
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
@@ -163,7 +163,7 @@ def predict_by_window(req: PredictByWindowReq):
         if not w:
             raise HTTPException(404, f"id {req.id} no existe")
 
-        # 2) Predicción
+        # 2) Predicción SVM calibrado
         pred_label, confianza = _svm_predict_row(w)
 
         uid = int(w["id_usuario"])
@@ -175,64 +175,70 @@ def predict_by_window(req: PredictByWindowReq):
             uid, sid, confianza, pred_label=pred_label, now_ts=center_ts
         )
 
-        # 4) Persistir predicción en windows
+        # 4) Persistir predicción en windows (misma transacción)
         cur.execute(
             "UPDATE windows SET pred_label=%s, confianza=%s WHERE id=%s",
             (pred_label, confianza, req.id),
         )
 
         ask_id = None
+
         if ask:
-            # registrar que preguntamos (cooldown, etc.)
+            # registrar que preguntamos (cooldown, etc.) en memoria de policy
             policy.mark_asked(uid, sid, center_ts)
 
             st = _to_utc(w["start_time"])
             et = _to_utc(w["end_time"])
 
-            with get_conn() as conn2, conn2.cursor(cursor_factory=RealDictCursor) as cur2:
-                # ¿ya hay una "pendiente" (label IS NULL) para esta sesión/usuario?
+            # 5) “Fila pendiente por sesión”
+            # Usa el MISMO conn para que todo quede en una sola transacción.
+            cur2 = conn.cursor(cursor_factory=RealDictCursor)
+
+            # Intentar tomar la fila pendiente (label IS NULL) y bloquearla
+            cur2.execute(
+                """
+                SELECT id
+                  FROM intervalos_label
+                 WHERE session_id = %s
+                   AND id_usuario = %s
+                   AND label IS NULL
+                 ORDER BY id DESC
+                 LIMIT 1
+                 FOR UPDATE
+                """,
+                (sid, uid),
+            )
+            pend = cur2.fetchone()
+
+            if pend:
+                ask_id = pend["id"]
+                # actualiza reason y tiempos
                 cur2.execute(
                     """
-                    SELECT id
-                      FROM intervalos_label
-                    WHERE session_id=%s
-                      AND id_usuario=%s
-                      AND label IS NULL
-                    ORDER BY id DESC
-                    LIMIT 1
+                    UPDATE intervalos_label
+                       SET reason     = %s,
+                           start_ts   = %s,
+                           end_ts     = %s,
+                           created_at = NOW()
+                     WHERE id = %s
                     """,
-                    (sid, uid),
+                    (ask_reason, st, et, ask_id),
                 )
-                pend = cur2.fetchone()
+            else:
+                # crea una sola fila “pendiente” para esa sesión
+                cur2.execute(
+                    """
+                    INSERT INTO intervalos_label
+                        (session_id, id_usuario, start_ts, end_ts, reason, created_at, label)
+                    VALUES
+                        (%s, %s, %s, %s, %s, NOW(), NULL)
+                    RETURNING id
+                    """,
+                    (sid, uid, st, et, ask_reason),
+                )
+                ask_id = cur2.fetchone()["id"]
 
-                if pend:
-                    ask_id = pend["id"]
-                    cur2.execute(
-                        """
-                        UPDATE intervalos_label
-                          SET reason    = %s,
-                              start_ts  = %s,
-                              end_ts    = %s,
-                              created_at = NOW()
-                        WHERE id = %s
-                        """,
-                        (ask_reason, st, et, ask_id),
-                    )
-                else:
-                    cur2.execute(
-                        """
-                        INSERT INTO intervalos_label
-                            (session_id, id_usuario, start_ts, end_ts, reason, created_at, label)
-                        VALUES
-                            (%s, %s, %s, %s, %s, NOW(), NULL)
-                        RETURNING id
-                        """,
-                        (sid, uid, st, et, ask_reason),
-                    )
-                    ask_id = cur2.fetchone()["id"]
-
-                conn2.commit()
-
+        # al salir del with conn: si no hubo excepciones, COMMIT
     return {
         "id": req.id,
         "pred_label": pred_label,
