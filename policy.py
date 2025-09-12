@@ -21,10 +21,10 @@ from typing import Deque, Tuple, Dict, Optional
 """**Variables para definir las reglas**"""
 
 # --- UMBRALES ---
-MIN_CONF = 0.85         # incertidumbre sostenida
-N_CONSEC = 5            # cuántas seguidas < MIN_CONF
+MIN_CONF = 0.9         # incertidumbre sostenida
+N_CONSEC = 3            # cuántas seguidas < MIN_CONF
 
-SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
+SWITCH_MIN_CONF = 0.95  # confianza mínima para contar al switch
 SWITCH_N_CONSEC = 5    # cuántas ventanas consecutivas con la NUEVA pred_label
 
 COOLDOWN_S = 120        # anti-spam general entre preguntas
