@@ -381,13 +381,27 @@ Cargar o crear el learner
 @app.on_event("startup")
 def _startup():
     import river
+    # Lee el env y muéstralo (por si viene mal escrito)
+    sl_env = os.getenv("SL_ALGO", "").strip()
     print("River version:", getattr(river, "__version__", "unknown"),
-          "SL_ALGO env:", SL_ALGO)
-    _sl_load_latest(conn)
+          "SL_ALGO env:", sl_env or "(default)")
+
+    # Asegura que haya un learner listo aunque la carga falle
+    global SL_LEARNER, SL_METRIC, SL_PROMOTED
+
+    with get_conn() as conn:
+        try:
+            _sl_load_latest(conn)
+        except Exception as e:
+            # No revientes el deploy si no existe la tabla o hay cualquier problema
+            print("WARN: _sl_load_latest failed → fallback a nuevo learner.", repr(e))
+            SL_LEARNER = _sl_make_learner()
+            SL_METRIC = metrics.Accuracy()
+            SL_PROMOTED = False
 
 """**Configuración de SL**"""
 
-SL_ALGO = "arf"  # "arf" (AdaptiveRandomForest) o "ht" (HoeffdingTree)
+SL_ALGO = (os.getenv("SL_ALGO", "HT") or "HT").upper()  # "ARF" o "HT"
 SL_LEARNER = None
 SL_METRIC = metrics.Accuracy()
 SL_PROMOTED = False  # cuando pase a principal
