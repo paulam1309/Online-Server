@@ -15,6 +15,8 @@ LLama a su vez a policy engine en caso de que la confianza baje del 70%
 **LIBRERÍAS**
 """
 
+
+
 import os, json, joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -170,6 +172,22 @@ def predict_by_window(req: PredictByWindowReq):
         uid = int(w["id_usuario"])
         sid = int(w["session_id"])
         center_ts = _center_ts(w)
+
+        cur.execute("""
+            SELECT created_at, label
+              FROM intervalos_label
+             WHERE session_id = %s
+               AND label IS NOT NULL
+             ORDER BY created_at ASC
+             LIMIT 1
+        """, (sid,))
+        seed = cur.fetchone()
+        if seed:
+            policy.mark_labeled(
+                uid, sid,
+                now_ts=seed["created_at"].timestamp(),
+                label=seed["label"]
+            )
 
         # 3) Motor de políticas
         ask, ask_reason = policy.should_ask(
