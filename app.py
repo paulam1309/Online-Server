@@ -396,38 +396,42 @@ PROMOTE_MIN_UPDATES = 2000
 def _sl_make_learner():
     """
     Construye el learner de SL según SL_ALGO.
-    Soporta River ARF con ambas APIs: ARFClassifier (>=0.20) y
-    AdaptiveRandomForestClassifier (versiones viejas).
+    Usa imports explícitos para ARF, compatibles con distintas versiones de river.
     """
-    from river import tree, ensemble
+    from river import tree  # OK para HT
 
-    if SL_ALGO.upper() == "HT":
+    algo = (SL_ALGO or "HT").upper()
+
+    if algo == "HT":
         return tree.HoeffdingTreeClassifier(
-            grace_period=50,  # puedes ajustar
+            grace_period=50,
             delta=1e-5,
             leaf_prediction="mc",
         )
 
-    if SL_ALGO.upper() == "ARF":
-        # River moderno
-        if hasattr(ensemble, "ARFClassifier"):
-            return ensemble.ARFClassifier(
-                n_models=10,            # tamaño del bosque
-                max_features="sqrt",    # típico en RF
-                lambda_value=6,         # bagging
-            )
-        # Fallback para APIs antiguas
-        if hasattr(ensemble, "AdaptiveRandomForestClassifier"):
-            return ensemble.AdaptiveRandomForestClassifier(
+    if algo == "ARF":
+        # River >= 0.20
+        try:
+            from river.ensemble import ARFClassifier  # import explícito
+            return ARFClassifier(
                 n_models=10,
                 max_features="sqrt",
                 lambda_value=6,
             )
-
-        raise RuntimeError(
-            "Tu versión de 'river' no trae ARFClassifier. "
-            "Actualiza a river>=0.20 o usa SL_ALGO='HT'."
-        )
+        except Exception:
+            # Fallback para APIs antiguas (nombre viejo)
+            try:
+                from river.ensemble import AdaptiveRandomForestClassifier  # import explícito
+                return AdaptiveRandomForestClassifier(
+                    n_models=10,
+                    max_features="sqrt",
+                    lambda_value=6,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "No pude importar ARF (ni ARFClassifier ni AdaptiveRandomForestClassifier). "
+                    "Actualiza river>=0.20 o usa SL_ALGO='HT'. Detalle: " + repr(e)
+                )
 
     raise ValueError(f"SL_ALGO desconocido: {SL_ALGO}")
 
