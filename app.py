@@ -178,18 +178,17 @@ def predict_by_window(req: PredictByWindowReq):
         center_ts = _center_ts(w)
 
         cur.execute("""
-            SELECT created_at, label
-              FROM intervalos_label
-             WHERE session_id = %s
-               AND label IS NOT NULL
-             ORDER BY created_at ASC
-             LIMIT 1
+            SELECT COALESCE(EXTRACT(EPOCH FROM end_ts), EXTRACT(EPOCH FROM created_at)) AS ts, label
+            FROM intervalos_label
+            WHERE id_usuario = %s AND session_id = %s AND label IS NOT NULL
+            ORDER BY COALESCE(end_ts, created_at) DESC
+            LIMIT 1
         """, (sid,))
         seed = cur.fetchone()
         if seed:
             policy.mark_labeled(
                 uid, sid,
-                now_ts=seed["created_at"].timestamp(),
+                now_ts=float(seed["ts"]),
                 label=seed["label"]
             )
 
@@ -242,23 +241,25 @@ def predict_by_window(req: PredictByWindowReq):
                 """, (uid, sid, st, et, ask_reason))
                 ask_id = cur.fetchone()["id"]
 
-        # SL (sombra): predecir y guardar en windows
-        sl_pred, sl_conf = _sl_predict_row(w)
-        if sl_pred is not None:
-            cur.execute(
-                "UPDATE windows SET actividad=%s, precision=%s WHERE id=%s",
-                (sl_pred, sl_conf, req.id)
-            )
+        sl_pred, sl_conf = None, None
+        if SL_LEARNER is not None and getattr(SL_LEARNER, "_n_updates", 0) >= 50:
+            x = _row_to_x(w)
+            sl_pred = SL_LEARNER.predict_one(x)
+            proba   = SL_LEARNER.predict_proba_one(x) or {}
+            sl_conf = float(proba.get(sl_pred, 0.0)) if sl_pred is not None else None
 
-        # ¿Qué devuelves? Si promoviste, responde con SL; si no, SVM.
-        resp_pred = sl_pred if SL_PROMOTED and sl_pred is not None else pred_label
-        resp_conf = sl_conf if SL_PROMOTED and sl_conf is not None else confianza
+            cur.execute("""
+                UPDATE windows
+                  SET actividad = %s,
+                      precision = %s,
+                      sl_trained = TRUE
+                WHERE id = %s
+            """, (sl_pred, sl_conf, req.id))
 
-        # 6) Commit al salir del with si no hubo excepción
     return {
         "id": req.id,
-        "pred_label": resp_pred,
-        "confianza": resp_conf,
+        "pred_label": pred_label,
+        "confianza": confianza,
         "actividad": sl_pred,         # SL
         "precision": sl_conf,         # SL
         "ask_label": ask,
