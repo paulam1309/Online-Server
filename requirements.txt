@@ -4,5 +4,5 @@ pandas==2.2.2
 scikit-learn==1.6.1
 joblib==1.4.2
 psycopg2-binary==2.9.9
-river>=0.20,<0.22
+river==0.21.1
 dill>=0.3.6
