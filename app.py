@@ -380,8 +380,10 @@ Cargar o crear el learner
 
 @app.on_event("startup")
 def _startup():
-    with get_conn() as conn:
-        _sl_load_latest(conn)   # si hay snapshot en DB lo carga; si no, crea uno nuevo
+    import river
+    print("River version:", getattr(river, "__version__", "unknown"),
+          "SL_ALGO env:", SL_ALGO)
+    _sl_load_latest(conn)
 
 """**Configuración de SL**"""
 
@@ -394,46 +396,34 @@ PROMOTE_ACC = 0.85
 PROMOTE_MIN_UPDATES = 2000
 
 def _sl_make_learner():
-    """
-    Construye el learner de SL según SL_ALGO.
-    Usa imports explícitos para ARF, compatibles con distintas versiones de river.
-    """
-    from river import tree  # OK para HT
+    """Construye el learner de SL según SL_ALGO, con fallback seguro a HT."""
+    from river import tree
 
     algo = (SL_ALGO or "HT").upper()
 
-    if algo == "HT":
-        return tree.HoeffdingTreeClassifier(
-            grace_period=50,
-            delta=1e-5,
-            leaf_prediction="mc",
-        )
-
     if algo == "ARF":
-        # River >= 0.20
         try:
-            from river.ensemble import ARFClassifier  # import explícito
+            try:
+                # River >= ~0.20
+                from river.ensemble import ARFClassifier
+            except Exception:
+                # Intento con nombre antiguo (algunas builds)
+                from river.ensemble import AdaptiveRandomForestClassifier as ARFClassifier
             return ARFClassifier(
                 n_models=10,
                 max_features="sqrt",
                 lambda_value=6,
             )
-        except Exception:
-            # Fallback para APIs antiguas (nombre viejo)
-            try:
-                from river.ensemble import AdaptiveRandomForestClassifier  # import explícito
-                return AdaptiveRandomForestClassifier(
-                    n_models=10,
-                    max_features="sqrt",
-                    lambda_value=6,
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    "No pude importar ARF (ni ARFClassifier ni AdaptiveRandomForestClassifier). "
-                    "Actualiza river>=0.20 o usa SL_ALGO='HT'. Detalle: " + repr(e)
-                )
+        except Exception as e:
+            # <<< NO reventar el startup >>>
+            print("WARN: ARF no disponible en esta build de river → usando HT. Detalle:", repr(e))
 
-    raise ValueError(f"SL_ALGO desconocido: {SL_ALGO}")
+    # Default / fallback: Hoeffding Tree
+    return tree.HoeffdingTreeClassifier(
+        grace_period=50,
+        delta=1e-5,
+        leaf_prediction="mc",
+    )
 
 """**Helpers para features**"""
 
