@@ -416,7 +416,7 @@ def post_label(req: LabelReq):
                 try:
                     y_hat = SL_LEARNER.predict_one(x)
                     if y_hat is not None:
-                        SL_METRIC = SL_METRIC.update(y_true=y, y_pred=y_hat)
+                        SL_METRIC.update(y_true=y, y_pred=y_hat)
                 except Exception:
                     pass
 
@@ -536,14 +536,13 @@ def _sl_make_learner():
 """**Función snapshot**"""
 
 def _sl_snapshot(conn, promoted: bool = False):
-    """Guarda snapshot del SL en sl_models."""
     if not SL_ENABLED or SL_LEARNER is None:
         return
     buf = BytesIO()
     joblib.dump(SL_LEARNER, buf)
     buf.seek(0)
-    metric_json = {"accuracy": SL_METRIC.get()}
-
+    acc = float(SL_METRIC.get()) if SL_METRIC is not None else 0.0   # <- clave
+    metric_json = {"accuracy": acc}
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO sl_models (algo, promoted, n_updates, metric, model_bytes)
