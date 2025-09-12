@@ -204,26 +204,25 @@ def predict_by_window(req: PredictByWindowReq):
         )
 
         ask_id = None
-
-        # 5) Si hay que preguntar: marcar y luego UPDATE-then-INSERT
         if ask:
             policy.mark_asked(uid, sid, center_ts, ask_reason)
 
+            # Normaliza a UTC
             st = w["start_time"]; et = w["end_time"]
             if st.tzinfo is None: st = st.replace(tzinfo=timezone.utc)
             else:                 st = st.astimezone(timezone.utc)
             if et.tzinfo is None: et = et.replace(tzinfo=timezone.utc)
             else:                 et = et.astimezone(timezone.utc)
 
-            # 5.1) Intento de UPDATE a la fila pendiente de esa sesión (label IS NULL)
+            # 1) UPDATE de la fila pendiente (label IS NULL) de esa sesión/usuario
             cur.execute("""
                 UPDATE intervalos_label
-                  SET reason=%s,
-                      start_ts=%s,
-                      end_ts=%s,
-                      created_at=NOW()
-                WHERE id_usuario=%s
-                  AND session_id=%s
+                  SET reason = %s,
+                      start_ts = %s,
+                      end_ts   = %s,
+                      created_at = NOW()
+                WHERE id_usuario = %s
+                  AND session_id  = %s
                   AND label IS NULL
                 RETURNING id
             """, (ask_reason, st, et, uid, sid))
@@ -232,7 +231,7 @@ def predict_by_window(req: PredictByWindowReq):
             if row_upd:
                 ask_id = row_upd["id"]
             else:
-                # 5.2) Si no existía pendiente, INSERT nueva pendiente (label NULL)
+                # 2) INSERT si no existe pendiente
                 cur.execute("""
                     INSERT INTO intervalos_label
                         (id_usuario, session_id, start_ts, end_ts, label, reason, created_at)
