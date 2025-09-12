@@ -25,7 +25,7 @@ MIN_CONF = 0.85         # incertidumbre sostenida
 N_CONSEC = 5            # cuántas seguidas < MIN_CONF
 
 SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
-SWITCH_N_CONSEC = 10    # cuántas ventanas consecutivas con la NUEVA pred_label
+SWITCH_N_CONSEC = 5    # cuántas ventanas consecutivas con la NUEVA pred_label
 
 COOLDOWN_S = 120        # anti-spam general entre preguntas
 KEEP_ALIVE_S = 300      # 5 min
@@ -100,6 +100,11 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
                now_ts: float | None = None) -> tuple[bool, str]:
     now = _now(now_ts)
     st = record_conf(uid, sid, conf)
+    # anti-spam global
+
+    if now - st.last_ask_ts < COOLDOWN_S:
+        return False, "cooldown"
+
     if pred_label is not None:
         st = record_pred(uid, sid, pred_label, conf)
 
@@ -144,9 +149,11 @@ def mark_asked(uid: int, sid: int, now_ts: float | None = None, reason: str | No
 
 def mark_labeled(uid: int, sid: int, now_ts: float | None = None, label: str | None = None) -> None:
     st = STATE.setdefault(_key(uid, sid), SessionState())
-    st.last_label_ts = _now(now_ts)
+    now = _now(now_ts)
+    st.last_label_ts = now
+    st.last_keepalive_ts = now       # <- evita keep_alive inmediato tras etiquetar
     if label:
         st.last_user_label = label
-        st.mode_label = label         # <- alinear el modo con la etiqueta del usuario
-        st.change_label = None
-        st.change_run = 0
+        st.mode_label = label        # alinear “modo estable” con la etiqueta del usuario
+    st.change_label = None
+    st.change_run = 0
