@@ -190,6 +190,41 @@ def predict_by_window(req: PredictByWindowReq):
         if seed:
             policy.mark_labeled(uid, sid, now_ts=float(seed["ts"]), label=seed["label"])
 
+
+        # --- SL: entreno con ventanas ya etiquetadas (oportunista) ---
+        trained_now = 0
+        if SL_ENABLED and SL_LEARNER is not None:
+            cur.execute("""
+                SELECT id, features, etiqueta, *
+                  FROM windows
+                WHERE id_usuario = %s
+                  AND session_id  = %s
+                  AND etiqueta IS NOT NULL
+                  AND COALESCE(sl_trained, FALSE) = FALSE
+                ORDER BY id ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            """, (uid, sid, SL_TRAIN_CHUNK))
+            rows_train = cur.fetchall()
+
+            global SL_UPDATES, SL_METRIC
+            for r in rows_train:
+                x = _row_to_x(r); y = r["etiqueta"]
+                try:
+                    y_hat = SL_LEARNER.predict_one(x)
+                    if y_hat is not None:
+                        SL_METRIC = SL_METRIC.update(y_true=y, y_pred=y_hat)
+                except Exception:
+                    pass
+                SL_LEARNER.learn_one(x, y)
+                SL_UPDATES += 1
+                trained_now += 1
+                cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
+
+            # snapshot periódico
+            if trained_now and (SL_UPDATES % SL_SNAPSHOT_EVERY == 0):
+                _sl_snapshot(conn, promoted=False)
+
         # 3) Motor de políticas
         ask, ask_reason = policy.should_ask(
             uid, sid, confianza, pred_label=pred_label, now_ts=center_ts
@@ -459,13 +494,14 @@ def _startup():
 
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
-SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
-SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "200"))
+SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "5"))
+SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "10"))
 
 SL_LEARNER = None           # modelo online (HT)
 SL_METRIC = metrics.Accuracy()
 SL_UPDATES = 0              # # de learn_one() hechos
 SL_PROMOTED = False         # si SL desplaza al SVM (solo para respuesta a la app)
+SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "200"))
 
 def _sl_make_learner():
     """Construye el learner de SL según SL_ALGO, con fallback seguro a HT."""
