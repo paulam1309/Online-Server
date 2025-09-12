@@ -177,27 +177,24 @@ def predict_by_window(req: PredictByWindowReq):
         sid = int(w["session_id"])
         center_ts = _center_ts(w)
 
+        # ---- FIX: pasar (uid, sid), no (sid,) ----
         cur.execute("""
             SELECT COALESCE(EXTRACT(EPOCH FROM end_ts), EXTRACT(EPOCH FROM created_at)) AS ts, label
-            FROM intervalos_label
-            WHERE id_usuario = %s AND session_id = %s AND label IS NOT NULL
-            ORDER BY COALESCE(end_ts, created_at) DESC
-            LIMIT 1
-        """, (sid,))
+              FROM intervalos_label
+             WHERE id_usuario = %s AND session_id = %s AND label IS NOT NULL
+             ORDER BY COALESCE(end_ts, created_at) DESC
+             LIMIT 1
+        """, (uid, sid))
         seed = cur.fetchone()
         if seed:
-            policy.mark_labeled(
-                uid, sid,
-                now_ts=float(seed["ts"]),
-                label=seed["label"]
-            )
+            policy.mark_labeled(uid, sid, now_ts=float(seed["ts"]), label=seed["label"])
 
         # 3) Motor de políticas
         ask, ask_reason = policy.should_ask(
             uid, sid, confianza, pred_label=pred_label, now_ts=center_ts
         )
 
-        # 4) Persistir predicción en windows (misma transacción)
+        # 4) Guardar predicción SVM
         cur.execute(
             "UPDATE windows SET pred_label=%s, confianza=%s WHERE id=%s",
             (pred_label, confianza, req.id),
@@ -214,24 +211,23 @@ def predict_by_window(req: PredictByWindowReq):
             if et.tzinfo is None: et = et.replace(tzinfo=timezone.utc)
             else:                 et = et.astimezone(timezone.utc)
 
-            # 1) UPDATE de la fila pendiente (label IS NULL) de esa sesión/usuario
+            # UPDATE-then-INSERT de la pendiente
             cur.execute("""
                 UPDATE intervalos_label
-                  SET reason = %s,
-                      start_ts = %s,
-                      end_ts   = %s,
-                      created_at = NOW()
-                WHERE id_usuario = %s
-                  AND session_id  = %s
-                  AND label IS NULL
-                RETURNING id
+                   SET reason = %s,
+                       start_ts = %s,
+                       end_ts   = %s,
+                       created_at = NOW()
+                 WHERE id_usuario = %s
+                   AND session_id  = %s
+                   AND label IS NULL
+                 RETURNING id
             """, (ask_reason, st, et, uid, sid))
             row_upd = cur.fetchone()
 
             if row_upd:
                 ask_id = row_upd["id"]
             else:
-                # 2) INSERT si no existe pendiente
                 cur.execute("""
                     INSERT INTO intervalos_label
                         (id_usuario, session_id, start_ts, end_ts, label, reason, created_at)
@@ -240,6 +236,7 @@ def predict_by_window(req: PredictByWindowReq):
                 """, (uid, sid, st, et, ask_reason))
                 ask_id = cur.fetchone()["id"]
 
+        # 5) SL en sombra (si ya está templado)
         sl_pred, sl_conf = None, None
         if SL_LEARNER is not None and getattr(SL_LEARNER, "_n_updates", 0) >= 50:
             x = _row_to_x(w)
@@ -249,18 +246,18 @@ def predict_by_window(req: PredictByWindowReq):
 
             cur.execute("""
                 UPDATE windows
-                  SET actividad = %s,
-                      precision = %s,
-                      sl_trained = TRUE
-                WHERE id = %s
+                   SET actividad = %s,
+                       precision = %s,
+                       sl_trained = TRUE
+                 WHERE id = %s
             """, (sl_pred, sl_conf, req.id))
 
     return {
         "id": req.id,
-        "pred_label": pred_label,
-        "confianza": confianza,
-        "actividad": sl_pred,         # SL
-        "precision": sl_conf,         # SL
+        "pred_label": pred_label,     # SVM
+        "confianza": confianza,       # SVM
+        "actividad": sl_pred,         # SL sombra (si aplica)
+        "precision": sl_conf,         # SL sombra (si aplica)
         "ask_label": ask,
         "ask_reason": ask_reason,
         "ask_id": ask_id,
