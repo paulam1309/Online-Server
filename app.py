@@ -29,6 +29,10 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
+#SL
+import dill
+from river import tree, ensemble, metrics
+
 """**CONEXIÓN CON CON LA BASE DE DATOS**"""
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -238,16 +242,30 @@ def predict_by_window(req: PredictByWindowReq):
                 """, (uid, sid, st, et, ask_reason))
                 ask_id = cur.fetchone()["id"]
 
+        # SL (sombra): predecir y guardar en windows
+        sl_pred, sl_conf = _sl_predict_row(w)
+        if sl_pred is not None:
+            cur.execute(
+                "UPDATE windows SET actividad=%s, precision=%s WHERE id=%s",
+                (sl_pred, sl_conf, req.id)
+            )
+
+        # ¿Qué devuelves? Si promoviste, responde con SL; si no, SVM.
+        resp_pred = sl_pred if SL_PROMOTED and sl_pred is not None else pred_label
+        resp_conf = sl_conf if SL_PROMOTED and sl_conf is not None else confianza
 
         # 6) Commit al salir del with si no hubo excepción
     return {
         "id": req.id,
-        "pred_label": pred_label,
-        "confianza": confianza,
+        "pred_label": resp_pred,
+        "confianza": resp_conf,
+        "actividad": sl_pred,         # SL
+        "precision": sl_conf,         # SL
         "ask_label": ask,
         "ask_reason": ask_reason,
         "ask_id": ask_id,
         "classes": list(map(str, CLASSES)),
+        "sl_shadow": {"pred": sl_pred, "conf": sl_conf, "promoted": SL_PROMOTED}
     }
 
 """**Endpoint de prediccion pendiente**"""
@@ -339,7 +357,6 @@ def post_label(req: LabelReq):
                 RETURNING id
             """, (st, et, req.label, req.reason, req.id_usuario, req.session_id))
             interval_id = cur.fetchone()["id"]
-
         # 2) Commit en la misma transacción
         conn.commit()
 
@@ -356,15 +373,193 @@ def policy_mark_labeled(req: MarkReq):
     policy.mark_labeled(req.id_usuario, req.session_id, req.when.timestamp() if req.when else None)
     return {"ok": True}
 
-"""**SL**"""
+"""**STREAM LEARNING**
 
-@app.post("/sl/predict")
-def sl_predict(req: SLPredictReq):
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM windows WHERE id = %s", (req.id,))
-        if not cur.fetchone():
-            raise HTTPException(404, f"id {req.id} no existe")
+Cargar o crear el learner
+"""
 
-        cur.execute("UPDATE windows SET actividad=%s WHERE id=%s", (req.actividad, req.id))
+@app.on_event("startup")
+def _startup():
+    with get_conn() as conn:
+        _sl_load_latest(conn)   # si hay snapshot en DB lo carga; si no, crea uno nuevo
+
+"""**Configuración de SL**"""
+
+SL_ALGO = "arf"  # "arf" (AdaptiveRandomForest) o "ht" (HoeffdingTree)
+SL_LEARNER = None
+SL_METRIC = metrics.Accuracy()
+SL_PROMOTED = False  # cuando pase a principal
+SL_SAVE_EVERY = 200  # guarda modelo cada N updates
+PROMOTE_ACC = 0.85
+PROMOTE_MIN_UPDATES = 2000
+
+def _sl_make_learner():
+    if SL_ALGO == "arf":
+        return ensemble.AdaptiveRandomForestClassifier(
+            n_models=10,  # ajusta si quieres
+            seed=42
+        )
+    else:
+        return tree.HoeffdingTreeClassifier()
+
+"""**Helpers para features**"""
+
+def _row_to_x(row: dict) -> dict:
+    # Usa EXACTAMENTE las mismas features que usas para el SVM
+    # row viene de SELECT * FROM windows
+    x = {}
+    for f in FEATURES:
+        # OJO: si tus features están en columnas directas (no JSON), castea:
+        # x[f] = float(row[f])
+        # Si algunas están en un JSON (ej. "features"), adáptalo:
+        if f in row:
+            x[f] = float(row[f]) if row[f] is not None else 0.0
+        elif "features" in row and isinstance(row["features"], dict) and f in row["features"]:
+            x[f] = float(row["features"][f]) if row["features"][f] is not None else 0.0
+        else:
+            x[f] = 0.0
+    return x
+
+"""**Funciones para Postgres**"""
+
+def _sl_save(conn):
+    global SL_LEARNER, SL_METRIC, SL_ALGO, SL_PROMOTED
+    blob = dill.dumps(SL_LEARNER)
+    metric_json = {"accuracy": SL_METRIC.get()}  # métrica prequential
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO sl_models (algo, promoted, n_updates, metric, blob)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (SL_ALGO, SL_PROMOTED, getattr(SL_LEARNER, "_n_updates", 0), json.dumps(metric_json), psycopg2.Binary(blob)))
+    conn.commit()
+
+def _sl_load_latest(conn):
+    global SL_LEARNER, SL_METRIC, SL_PROMOTED, SL_ALGO
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM sl_models
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        if row:
+            SL_ALGO = row["algo"]
+            SL_PROMOTED = bool(row["promoted"])
+            SL_LEARNER = dill.loads(bytes(row["blob"]))
+            SL_METRIC = metrics.Accuracy()
+        else:
+            SL_LEARNER = _sl_make_learner()
+            SL_METRIC = metrics.Accuracy()
+            SL_PROMOTED = False
+
+"""**Inferir con SL**"""
+
+def _sl_predict_row(row: dict):
+    if SL_LEARNER is None:
+        return None, None
+    x = _row_to_x(row)
+    proba = SL_LEARNER.predict_proba_one(x)  # dict {clase: prob}
+    if not proba:
+        return None, None
+    cls = max(proba, key=proba.get)
+    conf = float(proba[cls])
+    return str(cls), conf
+
+"""**Entrenar SL con etiquetas del usuario**"""
+
+def _sl_train_on_row(row: dict, label: str):
+    """
+    Prequential: primero evalúa, luego entrena.
+    Actualiza SL_METRIC. Marca sl_trained=true en windows.
+    """
+    global SL_LEARNER, SL_METRIC
+    x = _row_to_x(row)
+    y_true = str(label)
+    y_hat = SL_LEARNER.predict_one(x)
+    if y_hat is not None:
+        SL_METRIC.update(y_true, y_hat)
+    SL_LEARNER.learn_one(x, y_true)
+    # contador interno (para decidir cuándo guardar)
+    n_updates = getattr(SL_LEARNER, "_n_updates", 0) + 1
+    setattr(SL_LEARNER, "_n_updates", n_updates)
+    return n_updates
+
+"""**Endpoint para entrenar**"""
+
+class SLTrainReq(BaseModel):
+    limit: int = 500  # cuántas ventanas entrenar por llamada
+
+@app.post("/sl_train_pending")
+def sl_train_pending(req: SLTrainReq):
+    global SL_PROMOTED
+    """
+    Busca ventanas con etiqueta (etiqueta no nula) y sl_trained=false,
+    entrena el SL y marca sl_trained=true.
+    """
+    done = 0
+    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # trae pendientes
+        cur.execute("""
+            SELECT id, *
+              FROM windows
+             WHERE etiqueta IS NOT NULL
+               AND sl_trained = FALSE
+             ORDER BY id
+             LIMIT %s
+        """, (req.limit,))
+        rows = cur.fetchall()
+        if not rows:
+            return {"trained": 0, "metric": {"accuracy": SL_METRIC.get()}}
+
+        for r in rows:
+            n_updates = _sl_train_on_row(r, r["etiqueta"])
+            # marca como entrenada
+            cur.execute("UPDATE windows SET sl_trained=TRUE WHERE id=%s", (r["id"],))
+            done += 1
+
+        # persiste modelo cada SL_SAVE_EVERY
+        if n_updates % SL_SAVE_EVERY == 0:
+            _sl_save(conn)
+
+        # Para promover SL
+        if SL_METRIC.get() >= PROMOTE_ACC and getattr(SL_LEARNER, "_n_updates", 0) >= PROMOTE_MIN_UPDATES:
+            SL_PROMOTED = True
+            _sl_save(conn)
         conn.commit()
-    return {"ok": True, "id": req.id, "actividad": req.actividad}
+
+    return {
+        "trained": done,
+        "metric": {"accuracy": SL_METRIC.get()},
+        "n_updates": getattr(SL_LEARNER, "_n_updates", 0)
+    }
+
+"""**Endpoint de estado y promoción**"""
+
+@app.get("/sl_status")
+def sl_status():
+    return {
+        "algo": SL_ALGO,
+        "promoted": SL_PROMOTED,
+        "metric": {"accuracy": SL_METRIC.get()},
+        "n_updates": getattr(SL_LEARNER, "_n_updates", 0)
+    }
+
+@app.post("/sl_promote")
+def sl_promote():
+    global SL_PROMOTED
+    SL_PROMOTED = True
+    # opcional: guarda snapshot con promoted=true
+    with get_conn() as conn:
+        _sl_save(conn)
+    return {"ok": True, "promoted": True}
+
+@app.post("/sl_reset")
+def sl_reset():
+    """Reinicia el learner en sombra (cuidado: borra aprendizaje actual)."""
+    global SL_LEARNER, SL_METRIC, SL_PROMOTED
+    SL_LEARNER = _sl_make_learner()
+    SL_METRIC = metrics.Accuracy()
+    SL_PROMOTED = False
+    with get_conn() as conn:
+        _sl_save(conn)
+    return {"ok": True}
