@@ -394,13 +394,42 @@ PROMOTE_ACC = 0.85
 PROMOTE_MIN_UPDATES = 2000
 
 def _sl_make_learner():
-    if SL_ALGO == "arf":
-        return ensemble.AdaptiveRandomForestClassifier(
-            n_models=10,  # ajusta si quieres
-            seed=42
+    """
+    Construye el learner de SL según SL_ALGO.
+    Soporta River ARF con ambas APIs: ARFClassifier (>=0.20) y
+    AdaptiveRandomForestClassifier (versiones viejas).
+    """
+    from river import tree, ensemble
+
+    if SL_ALGO.upper() == "HT":
+        return tree.HoeffdingTreeClassifier(
+            grace_period=50,  # puedes ajustar
+            delta=1e-5,
+            leaf_prediction="mc",
         )
-    else:
-        return tree.HoeffdingTreeClassifier()
+
+    if SL_ALGO.upper() == "ARF":
+        # River moderno
+        if hasattr(ensemble, "ARFClassifier"):
+            return ensemble.ARFClassifier(
+                n_models=10,            # tamaño del bosque
+                max_features="sqrt",    # típico en RF
+                lambda_value=6,         # bagging
+            )
+        # Fallback para APIs antiguas
+        if hasattr(ensemble, "AdaptiveRandomForestClassifier"):
+            return ensemble.AdaptiveRandomForestClassifier(
+                n_models=10,
+                max_features="sqrt",
+                lambda_value=6,
+            )
+
+        raise RuntimeError(
+            "Tu versión de 'river' no trae ARFClassifier. "
+            "Actualiza a river>=0.20 o usa SL_ALGO='HT'."
+        )
+
+    raise ValueError(f"SL_ALGO desconocido: {SL_ALGO}")
 
 """**Helpers para features**"""
 
