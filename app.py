@@ -164,6 +164,7 @@ Se construye del Dataframe y se pasa al .pkl para obtener pred_label + confianza
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
+    global SL_UPDATES
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # 1) Leer ventana
         cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
@@ -206,7 +207,6 @@ def predict_by_window(req: PredictByWindowReq):
             """, (uid, sid, SL_TRAIN_CHUNK))
             rows_train = cur.fetchall()
 
-            global SL_UPDATES
             for r in rows_train:
                 x = _row_to_x(r); y = r["etiqueta"]
                 try:
@@ -357,6 +357,7 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
+    global SL_UPDATES, SL_METRIC
     st = req.start_ts.astimezone(timezone.utc)
     et = req.end_ts.astimezone(timezone.utc)
     if et <= st:
@@ -407,7 +408,6 @@ def post_label(req: LabelReq):
             """, (req.id_usuario, req.session_id, et, st))
             ws = cur.fetchall()
 
-            global SL_UPDATES, SL_METRIC
             for wrow in ws:
                 x = _row_to_x(wrow)
                 y = req.label  # usa la etiqueta que envió el usuario
@@ -580,9 +580,9 @@ def _sl_train_on_row(row: dict, label: str):
     y_true = str(label)
     y_hat = SL_LEARNER.predict_one(x)
     if y_hat is not None:
-        SL_METRIC.update(y_true=y, y_pred=y_hat)
+        SL_METRIC.update(y_true=y_true, y_pred=y_hat)  # ← usar y_true
     SL_LEARNER.learn_one(x, y_true)
-    # contador interno (para decidir cuándo guardar)
+    #Actualizaciones del contador
     n_updates = getattr(SL_LEARNER, "_n_updates", 0) + 1
     setattr(SL_LEARNER, "_n_updates", n_updates)
     return n_updates
@@ -591,6 +591,7 @@ def _sl_train_on_row(row: dict, label: str):
 
 @app.post("/sl_train_pending")
 def sl_train_pending(req: PredictPendingReq):
+    global SL_UPDATES
     """
     Entrena en batch con ventanas etiquetadas aún no usadas por SL.
     Respeta SL_TRAIN_CHUNK para evitar bloqueos largos.
@@ -618,7 +619,6 @@ def sl_train_pending(req: PredictPendingReq):
         if not rows:
             return {"trained": 0, "updates": SL_UPDATES, "snapshot": False}
 
-        global SL_UPDATES
         for r in rows:
             x = _row_to_x(r)
             y = r["etiqueta"]
