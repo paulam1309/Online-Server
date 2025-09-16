@@ -191,7 +191,7 @@ def predict_by_window(req: PredictByWindowReq):
 
         # 3) SL: entrenamiento oportunista con ventanas etiquetadas pendientes
         trained_now = 0
-        if SL_ENABLED and SL_LEARNER is not None:
+        if SL_ENABLED and SL_LEARNER is not None and os.getenv("SL_OPPORTUNISTIC", "0") == "1":
             cur.execute("""
                 SELECT id, features, etiqueta, *
                   FROM windows
@@ -355,7 +355,7 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    global SL_UPDATES, SL_METRIC
+    global SL_UPDATES, SL_METRIC, SL_LEARNER
     st = req.start_ts.astimezone(timezone.utc)
     et = req.end_ts.astimezone(timezone.utc)
     if et <= st:
@@ -391,6 +391,30 @@ def post_label(req: LabelReq):
                 RETURNING id
             """, (st, et, req.label, req.reason, req.id_usuario, req.session_id))
             interval_id = cur.fetchone()["id"]
+
+        # 2.a) (nuevo) rollback si el tramo ya fue entrenado
+        cur.execute("""
+          SELECT COUNT(*) AS n_trained
+            FROM windows
+          WHERE id_usuario=%s AND session_id=%s
+            AND start_time < %s AND end_time > %s
+            AND COALESCE(sl_trained, FALSE) = TRUE
+        """, (req.id_usuario, req.session_id, et, st))
+        n_trained = cur.fetchone()["n_trained"]
+
+        if n_trained > 0:
+            cur.execute("SELECT model_bytes FROM sl_models ORDER BY id DESC LIMIT 1")
+            snap = cur.fetchone()
+            if snap:
+                model_bytes = snap["model_bytes"]
+                SL_LEARNER = joblib.load(BytesIO(model_bytes))
+                SL_METRIC = metrics.Accuracy()
+            cur.execute("""
+              UPDATE windows
+                SET sl_trained = FALSE
+              WHERE id_usuario=%s AND session_id=%s
+                AND start_time < %s AND end_time > %s
+            """, (req.id_usuario, req.session_id, et, st))
 
     # ENTRENAMIENTO ONLINE AL RECIBIR UNA ETIQUETA
         # 2.b) ENTRENAR SL con todas las ventanas cubiertas por [st, et]
@@ -606,11 +630,22 @@ def sl_train_pending(req: PredictPendingReq):
         cur.execute("""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
               FROM windows
-             WHERE etiqueta IS NOT NULL
-               AND COALESCE(sl_trained, FALSE) = FALSE
-             ORDER BY id ASC
-             LIMIT %s
-             FOR UPDATE SKIP LOCKED
+            WHERE etiqueta IS NOT NULL
+              AND COALESCE(sl_trained, FALSE) = FALSE
+              AND end_time < NOW() - INTERVAL '180 seconds'                 -- "freezer" 3 min
+              AND EXISTS (                                                     -- exige etiqueta FINAL
+                    SELECT 1
+                      FROM intervalos_label i
+                    WHERE i.id_usuario = id_usuario
+                      AND i.session_id = session_id
+                      AND i.label IS NOT NULL
+                      AND start_time < i.end_ts
+                      AND end_time   > i.start_ts
+                      AND i.created_at >= end_time                           -- decidida después
+              )
+            ORDER BY id ASC
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
         """, (SL_TRAIN_CHUNK,))
 
         rows = cur.fetchall()
