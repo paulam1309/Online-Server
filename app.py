@@ -641,7 +641,6 @@ def sl_train_pending(req: PredictPendingReq):
                       AND i.label IS NOT NULL
                       AND start_time < i.end_ts
                       AND end_time   > i.start_ts
-                      AND i.created_at >= end_time                           -- decidida después
               )
             ORDER BY id ASC
             LIMIT %s
