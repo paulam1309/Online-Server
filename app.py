@@ -15,8 +15,6 @@ LLama a su vez a policy engine en caso de que la confianza baje del 70%
 **LIBRERÍAS**
 """
 
-
-
 import os, json, joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -493,14 +491,14 @@ def _startup():
 
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
-SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "5"))
-SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "10"))
+SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "100"))
+SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "500"))
 
 SL_LEARNER = None           # modelo online (HT)
 SL_METRIC = metrics.Accuracy()
 SL_UPDATES = 0              # # de learn_one() hechos
 SL_PROMOTED = False         # si SL desplaza al SVM (solo para respuesta a la app)
-SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "200"))
+SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "500"))
 
 def _sl_make_learner():
     """Construye el learner de SL según SL_ALGO, con fallback seguro a HT."""

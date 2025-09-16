@@ -21,15 +21,15 @@ from typing import Deque, Tuple, Dict, Optional
 """**Variables para definir las reglas**"""
 
 # --- UMBRALES ---
-MIN_CONF = 0.9         # incertidumbre sostenida
-N_CONSEC = 3            # cuántas seguidas < MIN_CONF
+MIN_CONF = 0.75        # incertidumbre sostenida
+N_CONSEC = 5            # cuántas ventanas seguidas < MIN_CONF
 
-SWITCH_MIN_CONF = 0.95  # confianza mínima para contar al switch
-SWITCH_N_CONSEC = 5    # cuántas ventanas consecutivas con la NUEVA pred_label
+SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
+SWITCH_N_CONSEC = 10    # cuántas ventanas consecutivas con la NUEVA pred_label
 
 COOLDOWN_S = 90        # anti-spam general entre preguntas
 KEEP_ALIVE_S = 300      # 5 min
-MAX_ASKS_PER_H = 20     # presupuesto/hora
+MAX_ASKS_PER_H = 10     # presupuesto/hora
 
 """**Estado por sesión**"""
 
@@ -42,7 +42,7 @@ class SessionState:
 
     # tracking de cambio de actividad
     last_pred_label: str | None = None
-    mode_label: str | None = None             # <- NUEVO: "estado estable" actual del modelo
+    mode_label: str | None = None             # <- Estado estable actual del modelo
 
      # Swicth: seguimiento del candidato de cambio
     change_label: str | None = None
@@ -77,7 +77,7 @@ def record_pred(uid: int, sid: int, label: str, conf: float) -> SessionState:
 
     if conf >= SWITCH_MIN_CONF:
         if st.mode_label is None:
-            # Primera vez: asumimos este label como el "modo" estable
+            # Primera vez: Se asume este label como el "modo" estable
             st.mode_label = label
             st.change_label = None
             st.change_run = 0
