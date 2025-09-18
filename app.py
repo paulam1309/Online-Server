@@ -248,14 +248,12 @@ def predict_by_window(req: PredictByWindowReq):
             cur.execute("""
                 UPDATE intervalos_label
                    SET reason = %s,
-                       start_ts = %s,
-                       end_ts   = %s,
                        created_at = NOW()
                  WHERE id_usuario = %s
                    AND session_id  = %s
                    AND label IS NULL
                  RETURNING id
-            """, (ask_reason, st, et, uid, sid))
+            """, (ask_reason, uid, sid))
             row_upd = cur.fetchone()
 
             if row_upd:
@@ -263,8 +261,8 @@ def predict_by_window(req: PredictByWindowReq):
             else:
                 cur.execute("""
                     INSERT INTO intervalos_label
-                        (id_usuario, session_id, start_ts, end_ts, label, reason, created_at)
-                    VALUES (%s, %s, %s, %s, NULL, %s, NOW())
+                        (id_usuario, session_id, label, reason, created_at)
+                    VALUES (%s, %s, NULL, %s, NOW())
                     RETURNING id
                 """, (uid, sid, st, et, ask_reason))
                 ask_id = cur.fetchone()["id"]
@@ -626,7 +624,7 @@ def sl_train_pending(req: PredictPendingReq):
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Selecciona SOLO ventanas etiquetadas que aún no han sido usadas por SL
         # (y bloquea filas para evitar condiciones de carrera)
-        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "180"))
+        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "90"))
         cur.execute(f"""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
               FROM windows

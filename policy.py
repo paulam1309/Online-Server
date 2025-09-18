@@ -28,7 +28,7 @@ SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
 SWITCH_N_CONSEC = 10    # cuántas ventanas consecutivas con la NUEVA pred_label
 
 COOLDOWN_S = 90        # anti-spam general entre preguntas
-KEEP_ALIVE_S = 180      # 5 min
+KEEP_ALIVE_S = 150      # 5 min
 MAX_ASKS_PER_H = 10     # presupuesto/hora
 
 """**Estado por sesión**"""
@@ -111,8 +111,9 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
     # anti-spam
     if now - st.last_keepalive_ts < KEEP_ALIVE_S:
         return False, "cooldown"
-    _prune_hour(st, now)
 
+    #Preguntas por hora
+    _prune_hour(st, now)
     if len(st.asks_in_hour) >= MAX_ASKS_PER_H:
         return False, "budget"
 
