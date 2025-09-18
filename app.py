@@ -237,13 +237,6 @@ def predict_by_window(req: PredictByWindowReq):
         if ask:
             policy.mark_asked(uid, sid, center_ts, ask_reason)
 
-            # Normaliza a UTC antes de escribir intervalo pendiente
-            st = w["start_time"]; et = w["end_time"]
-            if st.tzinfo is None: st = st.replace(tzinfo=timezone.utc)
-            else:                 st = st.astimezone(timezone.utc)
-            if et.tzinfo is None: et = et.replace(tzinfo=timezone.utc)
-            else:                 et = et.astimezone(timezone.utc)
-
             # UPDATE-then-INSERT de la pendiente
             cur.execute("""
                 UPDATE intervalos_label
@@ -264,7 +257,7 @@ def predict_by_window(req: PredictByWindowReq):
                         (id_usuario, session_id, label, reason, created_at)
                     VALUES (%s, %s, NULL, %s, NOW())
                     RETURNING id
-                """, (uid, sid, st, et, ask_reason))
+                """, (uid, sid, ask_reason))
                 ask_id = cur.fetchone()["id"]
 
         # 6) SL en sombra: escribir actividad/precision si ya calentó
