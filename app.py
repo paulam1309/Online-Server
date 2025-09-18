@@ -15,14 +15,16 @@ LLama a su vez a policy engine en caso de que la confianza baje del 70%
 **LIBRERÍAS**
 """
 
-
-
 import os, json, joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
-import policy  # importa el motor de reglas
+
+#MOTOR DE REGLAS
+import policy
+
+#BASE DE DATOS
 import psycopg2
 from psycopg2 import errors
 from psycopg2.extras import RealDictCursor
@@ -77,7 +79,6 @@ app.add_middleware(
 
 """**Helpers**"""
 
-# --- helpers ---
 def _df_from_window_row(row: Dict[str, Any]) -> pd.DataFrame:
     if row.get("features"):
         feats: Dict[str, Any] = row["features"]
@@ -156,11 +157,7 @@ def health():
 def schema():
     return {"features": FEATURES, "classes": list(map(str, CLASSES))}
 
-"""**Endpoint de Ingest**
-
-
-Se construye del Dataframe y se pasa al .pkl para obtener pred_label + confianza
-"""
+"""**Endpoint de Ingest, Entrenamiento y Evaluación de Policy**"""
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
@@ -193,7 +190,7 @@ def predict_by_window(req: PredictByWindowReq):
 
         # 3) SL: entrenamiento oportunista con ventanas etiquetadas pendientes
         trained_now = 0
-        if SL_ENABLED and SL_LEARNER is not None:
+        if SL_ENABLED and SL_LEARNER is not None and os.getenv("SL_OPPORTUNISTIC","0") == "1":
             cur.execute("""
                 SELECT id, features, etiqueta, *
                   FROM windows
@@ -357,7 +354,7 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    global SL_UPDATES, SL_METRIC
+    global SL_UPDATES, SL_METRIC, SL_LEARNER
     st = req.start_ts.astimezone(timezone.utc)
     et = req.end_ts.astimezone(timezone.utc)
     if et <= st:
@@ -393,6 +390,30 @@ def post_label(req: LabelReq):
                 RETURNING id
             """, (st, et, req.label, req.reason, req.id_usuario, req.session_id))
             interval_id = cur.fetchone()["id"]
+
+        # 2.a) (nuevo) rollback si el tramo ya fue entrenado
+        cur.execute("""
+          SELECT COUNT(*) AS n_trained
+            FROM windows
+          WHERE id_usuario=%s AND session_id=%s
+            AND start_time < %s AND end_time > %s
+            AND COALESCE(sl_trained, FALSE) = TRUE
+        """, (req.id_usuario, req.session_id, et, st))
+        n_trained = cur.fetchone()["n_trained"]
+
+        if n_trained > 0:
+            cur.execute("SELECT model_bytes FROM sl_models ORDER BY id DESC LIMIT 1")
+            snap = cur.fetchone()
+            if snap:
+                model_bytes = snap["model_bytes"]
+                SL_LEARNER = joblib.load(BytesIO(model_bytes))
+                SL_METRIC = metrics.Accuracy()
+            cur.execute("""
+              UPDATE windows
+                SET sl_trained = FALSE
+              WHERE id_usuario=%s AND session_id=%s
+                AND start_time < %s AND end_time > %s
+            """, (req.id_usuario, req.session_id, et, st))
 
     # ENTRENAMIENTO ONLINE AL RECIBIR UNA ETIQUETA
         # 2.b) ENTRENAR SL con todas las ventanas cubiertas por [st, et]
@@ -493,14 +514,14 @@ def _startup():
 
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
-SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "5"))
-SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "10"))
+SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "100"))
+SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "500"))
 
 SL_LEARNER = None           # modelo online (HT)
 SL_METRIC = metrics.Accuracy()
 SL_UPDATES = 0              # # de learn_one() hechos
 SL_PROMOTED = False         # si SL desplaza al SVM (solo para respuesta a la app)
-SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "200"))
+SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "500"))
 
 def _sl_make_learner():
     """Construye el learner de SL según SL_ALGO, con fallback seguro a HT."""
@@ -605,14 +626,35 @@ def sl_train_pending(req: PredictPendingReq):
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Selecciona SOLO ventanas etiquetadas que aún no han sido usadas por SL
         # (y bloquea filas para evitar condiciones de carrera)
-        cur.execute("""
+        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "180"))
+        cur.execute(f"""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
               FROM windows
-             WHERE etiqueta IS NOT NULL
-               AND COALESCE(sl_trained, FALSE) = FALSE
-             ORDER BY id ASC
-             LIMIT %s
-             FOR UPDATE SKIP LOCKED
+            WHERE etiqueta IS NOT NULL
+              AND etiqueta <> ''
+              AND etiqueta NOT IN ('null','NULL','None')
+              AND COALESCE(sl_trained, FALSE) = FALSE
+              AND end_time < NOW() - INTERVAL '{freeze_secs} seconds'
+              AND EXISTS (
+                    SELECT 1
+                      FROM intervalos_label i
+                    WHERE i.id_usuario = id_usuario
+                      AND i.session_id = session_id
+                      AND i.label IS NOT NULL
+                      AND (
+                            -- Caso A: intervalo con rango explícito
+                            (i.start_ts IS NOT NULL AND i.end_ts IS NOT NULL
+                            AND start_time < i.end_ts
+                            AND end_time   > i.start_ts)
+                        OR -- Caso B: intervalo por duración (sin tocar end_ts en el otro server)
+                            (i.duracion IS NOT NULL AND i.created_at IS NOT NULL
+                            AND end_time BETWEEN (i.created_at - (i.duracion::int * INTERVAL '1 second'))
+                                            AND  i.created_at)
+                      )
+              )
+            ORDER BY id ASC
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
         """, (SL_TRAIN_CHUNK,))
 
         rows = cur.fetchall()
