@@ -51,6 +51,7 @@ def _to_utc(dt):
 """**CARGA DE ARCHIVOS NECESARIOS**"""
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/svm_calibrado.pkl")
+POLICY_FEED_FROM_BATCH = os.getenv("POLICY_FEED_FROM_BATCH", "0") == "1"
 SCHEMA_PATH = os.getenv("SCHEMA_PATH", "processing/schema.json")
 
 try:
@@ -337,6 +338,16 @@ def predict_pending(req: PredictPendingReq):
                 # (opcional: loggear e)
                 continue
 
+            # --- Alimentar policy (solo estado), SIN disparar preguntas desde el batch ---
+            try:
+                if POLICY_FEED_FROM_BATCH:
+                    uid = int(row["id_usuario"])
+                    sid = int(row["session_id"])
+                    policy.feed_only(uid, sid, conf, pred_label=pred)
+            except Exception:
+                # No interrumpir el batch si algo sale mal
+                pass
+
         conn.commit()
 
     return {"processed": done}
@@ -617,7 +628,7 @@ def sl_train_pending(req: PredictPendingReq):
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Selecciona SOLO ventanas etiquetadas que aún no han sido usadas por SL
         # (y bloquea filas para evitar condiciones de carrera)
-        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "90"))
+        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "60"))
         cur.execute(f"""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
               FROM windows

@@ -158,3 +158,37 @@ def mark_labeled(uid: int, sid: int, now_ts: float | None = None, label: str | N
         st.mode_label = label        # alinear “modo estable” con la etiqueta del usuario
     st.change_label = None
     st.change_run = 0
+
+def feed_only(uid: int, sid: int, conf: float | None, pred_label: str | None = None):
+    """
+    Actualiza el estado interno (colas de confianzas y tracking de cambio)
+    SIN evaluar cooldown/presupuesto y SIN devolver 'ask'.
+    Útil para alimentar la policy desde el batch /predict_pending.
+    """
+    st = STATE.setdefault(_key(uid, sid), SessionState())
+
+    if conf is not None:
+        try:
+            st.last_conf.append(float(conf))
+            # la deque ya tiene maxlen=N_CONSEC (ver dataclass)
+        except Exception:
+            pass
+
+    if pred_label is not None:
+        # mismo tracking que en record_pred, pero sin condiciones de ask
+        label = str(pred_label)
+        if conf is not None and conf >= SWITCH_MIN_CONF:
+            if st.mode_label is None:
+                st.mode_label = label
+                st.change_label = None
+                st.change_run = 0
+            elif label == st.mode_label:
+                st.change_label = None
+                st.change_run = 0
+            else:
+                if st.change_label == label:
+                    st.change_run += 1
+                else:
+                    st.change_label = label
+                    st.change_run = 1
+        st.last_pred_label = label
