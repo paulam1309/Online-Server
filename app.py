@@ -500,7 +500,7 @@ def _startup():
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
 SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
-SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "500"))
+SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "300"))
 # Umbrales para promover SL a "principal"
 SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "300"))  # p.ej. 300
 SL_PROMOTE_MIN_ACC     = float(os.getenv("SL_PROMOTE_MIN_ACC", "0.90"))  # p.ej. 0.80 = 80%
@@ -554,6 +554,7 @@ def _sl_snapshot(conn, promoted: bool = False):
             INSERT INTO sl_models (algo, promoted, n_updates, metric, model_bytes)
             VALUES (%s, %s, %s, %s, %s)
         """, (SL_ALGO, promoted, SL_UPDATES, json.dumps(metric_json), psycopg2.Binary(buf.read())))
+    conn.commit()
 
 """**Helpers**"""
 

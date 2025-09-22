@@ -28,8 +28,8 @@ SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
 SWITCH_N_CONSEC = 10    # cuántas ventanas consecutivas con la NUEVA pred_label
 
 COOLDOWN_S = 90        # anti-spam general entre preguntas
-KEEP_ALIVE_S = 120      # 5 min
-MAX_ASKS_PER_H = 10     # presupuesto/hora
+KEEP_ALIVE_S = 150      # 5 min
+MAX_ASKS_PER_H = 25     # presupuesto/hora
 
 """**Estado por sesión**"""
 
