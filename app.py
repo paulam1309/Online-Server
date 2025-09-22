@@ -212,7 +212,7 @@ def predict_by_window(req: PredictByWindowReq):
                 trained_now += 1
                 cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
 
-            if trained_now and (SL_UPDATES % SL_SNAPSHOT_EVERY == 0):
+            if trained_now and (SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - trained_now) // SL_SNAPSHOT_EVERY):
                 _sl_snapshot(conn, promoted=False)
 
         # 4) Motor de políticas (preguntar etiqueta si baja confianza, cambio, keep-alive, etc.)
@@ -442,7 +442,7 @@ def post_label(req: LabelReq):
                 cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (wrow["id"],))
 
             # snapshot periódico
-            if SL_UPDATES and SL_UPDATES % SL_SNAPSHOT_EVERY == 0:
+            if SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - len(ws)) // SL_SNAPSHOT_EVERY:
                 _sl_snapshot(conn, promoted=False)
 
         # 2) Commit en la misma transacción
@@ -583,7 +583,7 @@ def sl_train_pending(req: PredictPendingReq):
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Selecciona SOLO ventanas etiquetadas que aún no han sido usadas por SL
         # (y bloquea filas para evitar condiciones de carrera)
-        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "60"))
+        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "30"))
 
         cur.execute("""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
@@ -641,7 +641,7 @@ def sl_train_pending(req: PredictPendingReq):
             cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
 
         # Snapshot periódico
-        if trained and (SL_UPDATES % SL_SNAPSHOT_EVERY == 0):
+        if trained and (SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - trained) // SL_SNAPSHOT_EVERY):
             _sl_snapshot(conn, promoted=False)
             snap = True
 
