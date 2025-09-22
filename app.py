@@ -26,14 +26,12 @@ import policy
 
 #BASE DE DATOS
 import psycopg2
-from psycopg2 import errors
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 #SL
-import dill
-from river import tree, ensemble, metrics
+from river import tree, metrics
 from io import BytesIO
 
 """**CONEXIÓN CON CON LA BASE DE DATOS**"""
@@ -134,11 +132,6 @@ class MarkReq(BaseModel):
     session_id: int
     when: Optional[datetime] = None
 
-class SLPredictReq(BaseModel):
-    id: int
-    actividad: str
-    precision: Optional[float] = None
-
 class PredictPendingReq(BaseModel):
     limit: int = 200
     id_usuario: Optional[int] = None
@@ -162,7 +155,7 @@ def schema():
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
-    global SL_UPDATES
+    global SL_UPDATES, SL_PROMOTED
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # 1) Leer ventana
         cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
@@ -170,7 +163,7 @@ def predict_by_window(req: PredictByWindowReq):
         if not w:
             raise HTTPException(404, f"id {req.id} no existe")
 
-        # 2) Predicción SVM calibrado
+        # 2) Predicción SVM calibrado (siempre: SVM -> pred_label/confianza)
         pred_label, confianza = _svm_predict_row(w)
 
         uid = int(w["id_usuario"])
@@ -189,9 +182,9 @@ def predict_by_window(req: PredictByWindowReq):
         if seed:
             policy.mark_labeled(uid, sid, now_ts=float(seed["ts"]), label=seed["label"])
 
-        # 3) SL: entrenamiento oportunista con ventanas etiquetadas pendientes
+        # 3) SL: entrenamiento oportunista (opcional) con ventanas etiquetadas pendientes
         trained_now = 0
-        if SL_ENABLED and SL_LEARNER is not None and os.getenv("SL_OPPORTUNISTIC","0") == "1":
+        if SL_ENABLED and SL_LEARNER is not None and os.getenv("SL_OPPORTUNISTIC", "0") == "1":
             cur.execute("""
                 SELECT id, features, etiqueta, *
                   FROM windows
@@ -210,7 +203,7 @@ def predict_by_window(req: PredictByWindowReq):
                 try:
                     y_hat = SL_LEARNER.predict_one(x)
                     if y_hat is not None:
-                        # ¡Sin reasignar!
+                        # Actualiza métrica sin reasignar el objeto
                         SL_METRIC.update(y_true=y, y_pred=y_hat)
                 except Exception:
                     pass
@@ -219,11 +212,10 @@ def predict_by_window(req: PredictByWindowReq):
                 trained_now += 1
                 cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
 
-            # Snapshot periódico
             if trained_now and (SL_UPDATES % SL_SNAPSHOT_EVERY == 0):
                 _sl_snapshot(conn, promoted=False)
 
-        # 4) Motor de políticas (preguntar etiqueta si baja confianza)
+        # 4) Motor de políticas (preguntar etiqueta si baja confianza, cambio, keep-alive, etc.)
         ask, ask_reason = policy.should_ask(
             uid, sid, confianza, pred_label=pred_label, now_ts=center_ts
         )
@@ -237,8 +229,7 @@ def predict_by_window(req: PredictByWindowReq):
         ask_id = None
         if ask:
             policy.mark_asked(uid, sid, center_ts, ask_reason)
-
-            # UPDATE-then-INSERT de la pendiente
+            # UPDATE-then-INSERT de la pendiente (sin tocar start/end aquí)
             cur.execute("""
                 UPDATE intervalos_label
                    SET reason = %s,
@@ -249,7 +240,6 @@ def predict_by_window(req: PredictByWindowReq):
                  RETURNING id
             """, (ask_reason, uid, sid))
             row_upd = cur.fetchone()
-
             if row_upd:
                 ask_id = row_upd["id"]
             else:
@@ -261,7 +251,7 @@ def predict_by_window(req: PredictByWindowReq):
                 """, (uid, sid, ask_reason))
                 ask_id = cur.fetchone()["id"]
 
-        # 6) SL en sombra: escribir actividad/precision si ya calentó
+        # 6) SL en sombra o “principal”: siempre escribir actividad/precision si ya calentó
         sl_pred, sl_conf = None, None
         if SL_ENABLED and SL_LEARNER is not None and SL_UPDATES >= SL_MIN_SHADOW_UPDATES:
             x = _row_to_x(w)
@@ -279,20 +269,34 @@ def predict_by_window(req: PredictByWindowReq):
                  WHERE id = %s
             """, (sl_pred, sl_conf, req.id))
 
+        # 7) Promoción automática de SL (flag + snapshot) si cumple umbrales
+        if SL_ENABLED and not SL_PROMOTED and SL_UPDATES >= SL_PROMOTE_MIN_UPDATES:
+            try:
+                acc = float(SL_METRIC.get() or 0.0)
+            except Exception:
+                acc = 0.0
+            if acc >= SL_PROMOTE_MIN_ACC:
+                SL_PROMOTED = True
+                _sl_snapshot(conn, promoted=True)
+
     return {
         "id": req.id,
-        "pred_label": pred_label,
-        "confianza": confianza,
-        "actividad": sl_pred,
-        "precision": sl_conf,
+        "pred_label": pred_label,       # SVM (sombra si SL ya promovido)
+        "confianza": confianza,         # SVM
+        "actividad": sl_pred,           # SL (sea sombra o principal, siempre aquí)
+        "precision": sl_conf,           # SL
         "ask_label": ask,
         "ask_reason": ask_reason,
         "ask_id": ask_id,
-        "sl_shadow": {"algo": SL_ALGO, "updates": SL_UPDATES, "promoted": SL_PROMOTED},
+        "sl_shadow": {
+            "algo": SL_ALGO,
+            "updates": SL_UPDATES,
+            "promoted": SL_PROMOTED
+        },
         "classes": list(map(str, CLASSES)),
     }
 
-"""**Endpoint de prediccion pendiente**"""
+"""**Endpoint de prediccion pendiente (Reserva por filas con prediccion pendiente)**"""
 
 @app.post("/predict_pending")
 def predict_pending(req: PredictPendingReq):
@@ -337,16 +341,6 @@ def predict_pending(req: PredictPendingReq):
                 # si una fila rara rompe, saltamos y seguimos con las demás
                 # (opcional: loggear e)
                 continue
-
-            # --- Alimentar policy (solo estado), SIN disparar preguntas desde el batch ---
-            try:
-                if POLICY_FEED_FROM_BATCH:
-                    uid = int(row["id_usuario"])
-                    sid = int(row["session_id"])
-                    policy.feed_only(uid, sid, conf, pred_label=pred)
-            except Exception:
-                # No interrumpir el batch si algo sale mal
-                pass
 
         conn.commit()
 
@@ -486,17 +480,6 @@ def _startup():
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS sl_models (
-                  id           bigserial PRIMARY KEY,
-                  created_at   timestamptz NOT NULL DEFAULT now(),
-                  algo         text NOT NULL,
-                  promoted     boolean NOT NULL DEFAULT false,
-                  n_updates    integer NOT NULL,
-                  metric       jsonb NOT NULL,
-                  model_bytes  bytea NOT NULL
-                )
-            """)
-            cur.execute("""
                 SELECT algo, n_updates, metric, model_bytes
                   FROM sl_models
                  ORDER BY id DESC
@@ -516,8 +499,12 @@ def _startup():
 
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
-SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "100"))
+SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
 SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "500"))
+# Umbrales para promover SL a "principal"
+SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "300"))  # p.ej. 300
+SL_PROMOTE_MIN_ACC     = float(os.getenv("SL_PROMOTE_MIN_ACC", "0.90"))  # p.ej. 0.80 = 80%
+
 
 SL_LEARNER = None           # modelo online (HT)
 SL_METRIC = metrics.Accuracy()
@@ -527,7 +514,6 @@ SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "500"))
 
 def _sl_make_learner():
     """Construye el learner de SL según SL_ALGO, con fallback seguro a HT."""
-    from river import tree
 
     algo = (SL_ALGO or "HT").upper()
 
@@ -569,7 +555,7 @@ def _sl_snapshot(conn, promoted: bool = False):
             VALUES (%s, %s, %s, %s, %s)
         """, (SL_ALGO, promoted, SL_UPDATES, json.dumps(metric_json), psycopg2.Binary(buf.read())))
 
-"""**Helpers para features**"""
+"""**Helpers**"""
 
 def _row_to_x(row: Dict[str, Any]) -> Dict[str, float]:
     """Convierte fila windows → dict(feature -> valor) respetando SCHEMA."""
@@ -577,38 +563,6 @@ def _row_to_x(row: Dict[str, Any]) -> Dict[str, float]:
         feats: Dict[str, Any] = row["features"]
         return {f: float(feats.get(f, 0.0)) for f in FEATURES}
     return {f: float(row.get(f, 0.0)) for f in FEATURES}
-
-"""**Inferir con SL**"""
-
-def _sl_predict_row(row: dict):
-    if SL_LEARNER is None:
-        return None, None
-    x = _row_to_x(row)
-    proba = SL_LEARNER.predict_proba_one(x)  # dict {clase: prob}
-    if not proba:
-        return None, None
-    cls = max(proba, key=proba.get)
-    conf = float(proba[cls])
-    return str(cls), conf
-
-"""**Entrenar SL con etiquetas del usuario**"""
-
-def _sl_train_on_row(row: dict, label: str):
-    """
-    Prequential: primero evalúa, luego entrena.
-    Actualiza SL_METRIC. Marca sl_trained=true en windows.
-    """
-    global SL_LEARNER, SL_METRIC
-    x = _row_to_x(row)
-    y_true = str(label)
-    y_hat = SL_LEARNER.predict_one(x)
-    if y_hat is not None:
-        SL_METRIC.update(y_true=y_true, y_pred=y_hat)  # ← usar y_true
-    SL_LEARNER.learn_one(x, y_true)
-    #Actualizaciones del contador
-    n_updates = getattr(SL_LEARNER, "_n_updates", 0) + 1
-    setattr(SL_LEARNER, "_n_updates", n_updates)
-    return n_updates
 
 """**Endpoint para entrenar**"""
 
@@ -629,14 +583,15 @@ def sl_train_pending(req: PredictPendingReq):
         # Selecciona SOLO ventanas etiquetadas que aún no han sido usadas por SL
         # (y bloquea filas para evitar condiciones de carrera)
         freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "60"))
-        cur.execute(f"""
+
+        cur.execute("""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
               FROM windows
             WHERE etiqueta IS NOT NULL
               AND etiqueta <> ''
               AND etiqueta NOT IN ('null','NULL','None')
               AND COALESCE(sl_trained, FALSE) = FALSE
-              AND end_time < NOW() - INTERVAL '{freeze_secs} seconds'
+              AND end_time < NOW() - ( %s || ' seconds')::interval
               AND EXISTS (
                     SELECT 1
                       FROM intervalos_label i
@@ -652,12 +607,12 @@ def sl_train_pending(req: PredictPendingReq):
                             (i.duracion IS NOT NULL AND i.created_at IS NOT NULL
                             AND end_time BETWEEN (i.created_at - (i.duracion::int * INTERVAL '1 second'))
                                             AND  i.created_at)
-                      )
-              )
+                          )
+                )
             ORDER BY id ASC
             LIMIT %s
             FOR UPDATE SKIP LOCKED
-        """, (SL_TRAIN_CHUNK,))
+        """, (str(freeze_secs), SL_TRAIN_CHUNK))
 
         rows = cur.fetchall()
         if not rows:
