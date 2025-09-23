@@ -619,7 +619,7 @@ SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
 SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
 SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "500"))
 # Umbrales para promover SL a "principal"
-SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "300"))  # p.ej. 300
+SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "500"))  # p.ej. 300
 SL_PROMOTE_MIN_ACC     = float(os.getenv("SL_PROMOTE_MIN_ACC", "0.90"))  # p.ej. 0.80 = 80%
 
 
@@ -633,7 +633,7 @@ SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "500"))
 SL2_ENABLED: bool = os.getenv("SL2_ENABLED", "0") == "1"
 SL2_ALGO: str = os.getenv("SL2_ALGO", "ARF")  # prueba ARF; fallback a HT
 SL2_MIN_SHADOW_UPDATES: int = int(os.getenv("SL2_MIN_SHADOW_UPDATES", "50"))
-SL2_SNAPSHOT_EVERY: int = int(os.getenv("SL2_SNAPSHOT_EVERY", "300"))
+SL2_SNAPSHOT_EVERY: int = int(os.getenv("SL2_SNAPSHOT_EVERY", "1000"))
 
 SL2_LEARNER = None
 SL2_METRIC = metrics.Accuracy()
