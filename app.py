@@ -155,7 +155,7 @@ def schema():
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
-    global SL_UPDATES, SL_PROMOTED
+    global SL_UPDATES, SL_PROMOTED, SL2_UPDATES
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # 1) Leer ventana
         cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
@@ -182,38 +182,72 @@ def predict_by_window(req: PredictByWindowReq):
         if seed:
             policy.mark_labeled(uid, sid, now_ts=float(seed["ts"]), label=seed["label"])
 
-        # 3) SL: entrenamiento oportunista (opcional) con ventanas etiquetadas pendientes
-        trained_now = 0
-        if SL_ENABLED and SL_LEARNER is not None and os.getenv("SL_OPPORTUNISTIC", "0") == "1":
+        # 3) SL/SL2: entrenamiento oportunista con ventanas etiquetadas pendientes (A y/o B)
+        trained_A = 0
+        trained_B = 0
+
+        want_op_A = (SL_ENABLED and SL_LEARNER is not None and os.getenv("SL_OPPORTUNISTIC", "0") == "1")
+        want_op_B = (SL2_ENABLED and SL2_LEARNER is not None and os.getenv("SL2_OPPORTUNISTIC", "0") == "1")
+
+        if want_op_A or want_op_B:
             cur.execute("""
                 SELECT id, features, etiqueta, *
                   FROM windows
-                 WHERE id_usuario = %s
-                   AND session_id  = %s
-                   AND etiqueta IS NOT NULL
-                   AND COALESCE(sl_trained, FALSE) = FALSE
-                 ORDER BY id ASC
-                 LIMIT %s
-                 FOR UPDATE SKIP LOCKED
-            """, (uid, sid, SL_TRAIN_CHUNK))
+                WHERE id_usuario = %s
+                  AND session_id  = %s
+                  AND etiqueta IS NOT NULL
+                  AND etiqueta <> ''
+                  AND etiqueta NOT IN ('null','NULL','None')
+                  AND (
+                        COALESCE(sl_trained, FALSE) = FALSE
+                      OR ( %s = '1' AND COALESCE(sl_trained_b, FALSE) = FALSE )
+                  )
+                ORDER BY id ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            """, (uid, sid, os.getenv("SL2_OPPORTUNISTIC", "0"), SL_TRAIN_CHUNK))
             rows_train = cur.fetchall()
 
             for r in rows_train:
                 x = _row_to_x(r); y = r["etiqueta"]
-                try:
-                    y_hat = SL_LEARNER.predict_one(x)
-                    if y_hat is not None:
-                        # Actualiza métrica sin reasignar el objeto
-                        SL_METRIC.update(y_true=y, y_pred=y_hat)
-                except Exception:
-                    pass
-                SL_LEARNER.learn_one(x, y)
-                SL_UPDATES += 1
-                trained_now += 1
-                cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
 
-            if trained_now and (SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - trained_now) // SL_SNAPSHOT_EVERY):
+                # --- A: prequential + learn
+                if want_op_A:
+                    try:
+                        y_hat = SL_LEARNER.predict_one(x)
+                        if y_hat is not None:
+                            SL_METRIC.update(y_true=y, y_pred=y_hat)
+                    except Exception:
+                        pass
+                    SL_LEARNER.learn_one(x, y)
+                    SL_UPDATES += 1
+                    trained_A += 1
+
+                # --- B: prequential + learn
+                if want_op_B:
+                    try:
+                        y_hat2 = SL2_LEARNER.predict_one(x)
+                        if y_hat2 is not None:
+                            SL2_METRIC.update(y_true=y, y_pred=y_hat2)
+                    except Exception:
+                        pass
+                    SL2_LEARNER.learn_one(x, y)
+                    SL2_UPDATES += 1
+                    trained_B += 1
+
+                # Marca como entrenado para evitar reuso infinitum.
+                if want_op_A and want_op_B:
+                    cur.execute("UPDATE windows SET sl_trained = TRUE, sl_trained_b = TRUE WHERE id = %s", (r["id"],))
+                elif want_op_A:
+                    cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
+                elif want_op_B:
+                    cur.execute("UPDATE windows SET sl_trained_b = TRUE WHERE id = %s", (r["id"],))
+
+            # Snapshots (disparo por cruce de múltiplos)
+            if trained_A and (SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - trained_A) // SL_SNAPSHOT_EVERY):
                 _sl_snapshot(conn, promoted=False)
+            if trained_B and (SL2_UPDATES // SL2_SNAPSHOT_EVERY > (SL2_UPDATES - trained_B) // SL2_SNAPSHOT_EVERY):
+                _sl2_snapshot(conn, promoted=False)
 
         # 4) Motor de políticas (preguntar etiqueta si baja confianza, cambio, keep-alive, etc.)
         ask, ask_reason = policy.should_ask(
@@ -269,6 +303,24 @@ def predict_by_window(req: PredictByWindowReq):
                  WHERE id = %s
             """, (sl_pred, sl_conf, req.id))
 
+        # === SL-B en sombra ===
+        sl2_pred, sl2_conf = None, None
+        if SL2_ENABLED and SL2_LEARNER is not None and SL2_UPDATES >= SL2_MIN_SHADOW_UPDATES:
+            x = _row_to_x(w)
+            try:
+                sl2_pred = SL2_LEARNER.predict_one(x)
+                proba2   = SL2_LEARNER.predict_proba_one(x) or {}
+                sl2_conf = float(proba2.get(sl2_pred, 0.0)) if sl2_pred is not None else None
+            except Exception:
+                sl2_pred, sl2_conf = None, None
+
+            cur.execute("""
+                UPDATE windows
+                  SET actividad_b = %s,
+                      precision_b = %s
+                WHERE id = %s
+            """, (sl2_pred, sl2_conf, req.id))
+
         # 7) Promoción automática de SL (flag + snapshot) si cumple umbrales
         if SL_ENABLED and not SL_PROMOTED and SL_UPDATES >= SL_PROMOTE_MIN_UPDATES:
             try:
@@ -285,6 +337,8 @@ def predict_by_window(req: PredictByWindowReq):
         "confianza": confianza,         # SVM
         "actividad": sl_pred,           # SL (sea sombra o principal, siempre aquí)
         "precision": sl_conf,           # SL
+        "actividad_b": sl2_pred,
+        "precision_b": sl2_conf,
         "ask_label": ask,
         "ask_reason": ask_reason,
         "ask_id": ask_id,
@@ -350,7 +404,7 @@ def predict_pending(req: PredictPendingReq):
 
 @app.post("/label")
 def post_label(req: LabelReq):
-    global SL_UPDATES, SL_METRIC, SL_LEARNER
+    global SL_UPDATES, SL_METRIC, SL_LEARNER, SL2_UPDATES
     st = req.start_ts.astimezone(timezone.utc)
     et = req.end_ts.astimezone(timezone.utc)
     if et <= st:
@@ -387,29 +441,49 @@ def post_label(req: LabelReq):
             """, (st, et, req.label, req.reason, req.id_usuario, req.session_id))
             interval_id = cur.fetchone()["id"]
 
-        # 2.a) (nuevo) rollback si el tramo ya fue entrenado
+        # 2.a) (nuevo) rollback si el tramo ya fue entrenado (A o B)
         cur.execute("""
-          SELECT COUNT(*) AS n_trained
-            FROM windows
+          SELECT
+            SUM(CASE WHEN COALESCE(sl_trained, FALSE) THEN 1 ELSE 0 END) AS n_a,
+            SUM(CASE WHEN COALESCE(sl_trained_b, FALSE) THEN 1 ELSE 0 END) AS n_b
+          FROM windows
           WHERE id_usuario=%s AND session_id=%s
             AND start_time < %s AND end_time > %s
-            AND COALESCE(sl_trained, FALSE) = TRUE
         """, (req.id_usuario, req.session_id, et, st))
-        n_trained = cur.fetchone()["n_trained"]
+        row_cnt = cur.fetchone() or {"n_a": 0, "n_b": 0}
+        n_trained_any = int(row_cnt["n_a"] or 0) + int(row_cnt["n_b"] or 0)
 
-        if n_trained > 0:
-            cur.execute("SELECT model_bytes FROM sl_models ORDER BY id DESC LIMIT 1")
-            snap = cur.fetchone()
-            if snap:
-                model_bytes = snap["model_bytes"]
-                SL_LEARNER = joblib.load(BytesIO(model_bytes))
-                SL_METRIC = metrics.Accuracy()
+        if n_trained_any > 0:
+            # Reload A
+            try:
+                cur.execute("SELECT model_bytes FROM sl_models ORDER BY id DESC LIMIT 1")
+                snap_a = cur.fetchone()
+                if snap_a and snap_a["model_bytes"]:
+                    SL_LEARNER = joblib.load(BytesIO(snap_a["model_bytes"]))
+                    SL_METRIC = metrics.Accuracy()
+            except Exception:
+                pass
+
+            # Reload B (si está habilitado)
+            if SL2_ENABLED:
+                try:
+                    cur.execute("SELECT model_bytes FROM sl_models_b ORDER BY id DESC LIMIT 1")
+                    snap_b = cur.fetchone()
+                    if snap_b and snap_b["model_bytes"]:
+                        SL2_LEARNER = joblib.load(BytesIO(snap_b["model_bytes"]))
+                        SL2_METRIC = metrics.Accuracy()
+                except Exception:
+                    pass
+
+            # Limpia flags A y B en el rango
             cur.execute("""
               UPDATE windows
-                SET sl_trained = FALSE
+                SET sl_trained = FALSE,
+                    sl_trained_b = FALSE
               WHERE id_usuario=%s AND session_id=%s
                 AND start_time < %s AND end_time > %s
             """, (req.id_usuario, req.session_id, et, st))
+
 
     # ENTRENAMIENTO ONLINE AL RECIBIR UNA ETIQUETA
         # 2.b) ENTRENAR SL con todas las ventanas cubiertas por [st, et]
@@ -427,23 +501,48 @@ def post_label(req: LabelReq):
 
             for wrow in ws:
                 x = _row_to_x(wrow)
-                y = req.label  # usa la etiqueta que envió el usuario
-                # (opcional) evaluar antes de aprender (prequential)
+                y = req.label
+
+                # A: prequential + learn
                 try:
                     y_hat = SL_LEARNER.predict_one(x)
                     if y_hat is not None:
                         SL_METRIC.update(y_true=y, y_pred=y_hat)
                 except Exception:
                     pass
-
                 SL_LEARNER.learn_one(x, y)
                 SL_UPDATES += 1
-                # marca para no re-entrenar esta ventana
-                cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (wrow["id"],))
+
+                # B: prequential + learn (si aplica)
+                if SL2_ENABLED and SL2_LEARNER is not None:
+                    try:
+                        y_hat2 = SL2_LEARNER.predict_one(x)
+                        if y_hat2 is not None:
+                            SL2_METRIC.update(y_true=y, y_pred=y_hat2)
+                    except Exception:
+                        pass
+                    SL2_LEARNER.learn_one(x, y)
+                    SL2_UPDATES += 1
+
+                # Marcar entrenado(s) UNA SOLA VEZ según lo que haya aprendido
+                if SL2_ENABLED and SL2_LEARNER is not None:
+                    cur.execute(
+                        "UPDATE windows SET sl_trained = TRUE, sl_trained_b = TRUE WHERE id = %s",
+                        (wrow['id'],)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE windows SET sl_trained = TRUE WHERE id = %s",
+                        (wrow['id'],)
+                    )
 
             # snapshot periódico
             if SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - len(ws)) // SL_SNAPSHOT_EVERY:
                 _sl_snapshot(conn, promoted=False)
+
+            # snapshot periódico
+            if SL2_UPDATES // SL2_SNAPSHOT_EVERY > (SL2_UPDATES - len(ws)) // SL2_SNAPSHOT_EVERY:
+                _sl2_snapshot(conn, promoted=False)
 
         # 2) Commit en la misma transacción
         conn.commit()
@@ -469,6 +568,8 @@ Cargar o crear el learner
 @app.on_event("startup")
 def _startup():
     global SL_LEARNER, SL_METRIC, SL_UPDATES
+    global SL2_LEARNER, SL2_METRIC, SL2_UPDATES
+
     if not SL_ENABLED:
         return
     # Crear learner (HT online)
@@ -495,8 +596,24 @@ def _startup():
         # si no hay snapshot, seguimos con el árbol vacío
         pass
 
+    if SL2_ENABLED:
+      SL2_LEARNER = _sl2_make_learner()
+      SL2_METRIC = metrics.Accuracy()
+      SL2_UPDATES = 0
+      try:
+          with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+              cur.execute("""SELECT algo, n_updates, metric, model_bytes
+                              FROM sl_models_b ORDER BY id DESC LIMIT 1""")
+              snap2 = cur.fetchone()
+              if snap2 and snap2["model_bytes"]:
+                  SL2_LEARNER = joblib.load(BytesIO(snap2["model_bytes"]))
+                  SL2_UPDATES = int(snap2["n_updates"] or 0)
+      except Exception:
+          pass
+
 """**Configuración de SL**"""
 
+# ======== Modelo A (HT) ==========
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
 SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
@@ -511,6 +628,17 @@ SL_METRIC = metrics.Accuracy()
 SL_UPDATES = 0              # # de learn_one() hechos
 SL_PROMOTED = False         # si SL desplaza al SVM (solo para respuesta a la app)
 SL_TRAIN_CHUNK = int(os.getenv("SL_TRAIN_CHUNK", "500"))
+
+# ===== Modelo B (ARF) =====
+SL2_ENABLED: bool = os.getenv("SL2_ENABLED", "0") == "1"
+SL2_ALGO: str = os.getenv("SL2_ALGO", "ARF")  # prueba ARF; fallback a HT
+SL2_MIN_SHADOW_UPDATES: int = int(os.getenv("SL2_MIN_SHADOW_UPDATES", "50"))
+SL2_SNAPSHOT_EVERY: int = int(os.getenv("SL2_SNAPSHOT_EVERY", "300"))
+
+SL2_LEARNER = None
+SL2_METRIC = metrics.Accuracy()
+SL2_UPDATES = 0
+SL2_PROMOTED = False
 
 def _sl_make_learner():
     """Construye el learner de SL según SL_ALGO, con fallback seguro a HT."""
@@ -541,6 +669,24 @@ def _sl_make_learner():
         leaf_prediction="mc",
     )
 
+def _sl2_make_learner():
+    algo = (SL2_ALGO or "HT").upper()
+    if algo == "ARF":
+        try:
+            try:
+                from river.ensemble import ARFClassifier
+            except Exception:
+                from river.ensemble import AdaptiveRandomForestClassifier as ARFClassifier
+            return ARFClassifier(n_models=10, max_features="sqrt", lambda_value=6)
+        except Exception as e:
+            print("WARN: SL2 ARF no disponible → usando HT. Detalle:", repr(e))
+    # Fallback: HT con hiperparámetros distintos al A
+    return tree.HoeffdingTreeClassifier(
+        grace_period=30,
+        delta=1e-6,
+        leaf_prediction="nb",
+    )
+
 """**Función snapshot**"""
 
 def _sl_snapshot(conn, promoted: bool = False):
@@ -556,6 +702,19 @@ def _sl_snapshot(conn, promoted: bool = False):
         """, (SL_ALGO, promoted, SL_UPDATES, json.dumps(metric_json), psycopg2.Binary(buf.read())))
     conn.commit()
 
+def _sl2_snapshot(conn, promoted: bool = False):
+    if not SL2_ENABLED or SL2_LEARNER is None:
+        return
+    buf = BytesIO(); joblib.dump(SL2_LEARNER, buf); buf.seek(0)
+    acc = float(SL2_METRIC.get()) if SL2_METRIC is not None else 0.0
+    metric_json = {"accuracy": acc}
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO sl_models_b (algo, promoted, n_updates, metric, model_bytes)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (SL2_ALGO, promoted, SL2_UPDATES, json.dumps(metric_json), psycopg2.Binary(buf.read())))
+    conn.commit()
+
 """**Helpers**"""
 
 def _row_to_x(row: Dict[str, Any]) -> Dict[str, float]:
@@ -569,15 +728,16 @@ def _row_to_x(row: Dict[str, Any]) -> Dict[str, float]:
 
 @app.post("/sl_train_pending")
 def sl_train_pending(req: PredictPendingReq):
-    global SL_UPDATES
+    global SL_UPDATES, SL2_UPDATES
     """
-    Entrena en batch con ventanas etiquetadas aún no usadas por SL.
+    Entrena en batch con ventanas etiquetadas aún no usadas por SL (A y opcionalmente B).
     Respeta SL_TRAIN_CHUNK para evitar bloqueos largos.
     """
     if not SL_ENABLED or SL_LEARNER is None:
         return {"trained": 0, "updates": SL_UPDATES, "snapshot": False}
 
     trained = 0
+    trained_2 = 0
     snap = False
 
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -591,7 +751,10 @@ def sl_train_pending(req: PredictPendingReq):
             WHERE etiqueta IS NOT NULL
               AND etiqueta <> ''
               AND etiqueta NOT IN ('null','NULL','None')
-              AND COALESCE(sl_trained, FALSE) = FALSE
+              AND (
+                    COALESCE(sl_trained, FALSE) = FALSE
+                 OR ( %s = '1' AND COALESCE(sl_trained_b, FALSE) = FALSE )
+              )
               AND end_time < NOW() - ( %s || ' seconds')::interval
               AND EXISTS (
                     SELECT 1
@@ -600,20 +763,18 @@ def sl_train_pending(req: PredictPendingReq):
                       AND i.session_id = session_id
                       AND i.label IS NOT NULL
                       AND (
-                            -- Caso A: intervalo con rango explícito
                             (i.start_ts IS NOT NULL AND i.end_ts IS NOT NULL
-                            AND start_time < i.end_ts
-                            AND end_time   > i.start_ts)
-                        OR -- Caso B: intervalo por duración (sin tocar end_ts en el otro server)
+                             AND start_time < i.end_ts AND end_time > i.start_ts)
+                           OR
                             (i.duracion IS NOT NULL AND i.created_at IS NOT NULL
-                            AND end_time BETWEEN (i.created_at - (i.duracion::int * INTERVAL '1 second'))
-                                            AND  i.created_at)
+                             AND end_time BETWEEN (i.created_at - (i.duracion::int * INTERVAL '1 second'))
+                                             AND  i.created_at)
                           )
                 )
             ORDER BY id ASC
             LIMIT %s
             FOR UPDATE SKIP LOCKED
-        """, (str(freeze_secs), SL_TRAIN_CHUNK))
+        """, ('1' if SL2_ENABLED and SL2_LEARNER is not None else '0', str(freeze_secs), SL_TRAIN_CHUNK))
 
         rows = cur.fetchall()
         if not rows:
@@ -623,26 +784,51 @@ def sl_train_pending(req: PredictPendingReq):
             x = _row_to_x(r)
             y = r["etiqueta"]
 
-            # (opcional) evaluar antes de aprender para actualizar métrica
+            # (opcional) evaluar antes de aprender para actualizar métrica (prequential)
             try:
                 y_hat = SL_LEARNER.predict_one(x)
                 if y_hat is not None:
-                    # ¡No reasignar!
                     SL_METRIC.update(y_true=y, y_pred=y_hat)
             except Exception:
                 pass
 
-            # Aprender
+            # Aprender con A
             SL_LEARNER.learn_one(x, y)
             SL_UPDATES += 1
             trained += 1
 
-            # Marcar ventana como usada por SL
-            cur.execute("UPDATE windows SET sl_trained = TRUE WHERE id = %s", (r["id"],))
+            # Aprender con B (si está habilitado)
+            if SL2_ENABLED and SL2_LEARNER is not None:
+                try:
+                    y_hat2 = SL2_LEARNER.predict_one(x)
+                    if y_hat2 is not None:
+                        SL2_METRIC.update(y_true=y, y_pred=y_hat2)
+                except Exception:
+                    pass
+                SL2_LEARNER.learn_one(x, y)
+                SL2_UPDATES += 1
+                trained_2 += 1
 
-        # Snapshot periódico
+            # Marcar la fila según qué modelos aprendieron
+            if SL2_ENABLED and SL2_LEARNER is not None:
+                cur.execute(
+                    "UPDATE windows SET sl_trained = TRUE, sl_trained_b = TRUE WHERE id = %s",
+                    (r["id"],)
+                )
+            else:
+                cur.execute(
+                    "UPDATE windows SET sl_trained = TRUE WHERE id = %s",
+                    (r["id"],)
+                )
+
+        # Snapshot periódico A
         if trained and (SL_UPDATES // SL_SNAPSHOT_EVERY > (SL_UPDATES - trained) // SL_SNAPSHOT_EVERY):
             _sl_snapshot(conn, promoted=False)
+            snap = True
+
+        # Snapshot periódico B
+        if trained_2 and (SL2_UPDATES // SL2_SNAPSHOT_EVERY > (SL2_UPDATES - trained_2) // SL2_SNAPSHOT_EVERY):
+            _sl2_snapshot(conn, promoted=False)
             snap = True
 
     return {"trained": trained, "updates": SL_UPDATES, "snapshot": snap}
@@ -656,6 +842,23 @@ def sl_status():
         "promoted": SL_PROMOTED,
         "metric": {"accuracy": SL_METRIC.get()},
         "n_updates": SL_UPDATES
+    }
+
+@app.get("/sl_status_all")
+def sl_status_all():
+    return {
+        "A": {
+            "algo": SL_ALGO,
+            "promoted": SL_PROMOTED,
+            "metric": {"accuracy": SL_METRIC.get()},
+            "n_updates": SL_UPDATES
+        },
+        "B": {
+            "algo": SL2_ALGO,
+            "enabled": SL2_ENABLED,
+            "metric": {"accuracy": SL2_METRIC.get() if SL2_ENABLED else None},
+            "n_updates": SL2_UPDATES if SL2_ENABLED else None
+        }
     }
 
 @app.post("/sl_promote")

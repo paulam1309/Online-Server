@@ -21,11 +21,11 @@ from typing import Deque, Tuple, Dict, Optional
 """**Variables para definir las reglas**"""
 
 # --- UMBRALES ---
-MIN_CONF = 0.75        # incertidumbre sostenida
+MIN_CONF = 0.85        # incertidumbre sostenida
 N_CONSEC = 5            # cuántas ventanas seguidas < MIN_CONF
 
-SWITCH_MIN_CONF = 0.90  # confianza mínima para contar al switch
-SWITCH_N_CONSEC = 10    # cuántas ventanas consecutivas con la NUEVA pred_label
+SWITCH_MIN_CONF = 0.80  # confianza mínima para contar al switch
+SWITCH_N_CONSEC = 7    # cuántas ventanas consecutivas con la NUEVA pred_label
 
 COOLDOWN_S = 90        # anti-spam general entre preguntas
 KEEP_ALIVE_S = 150      # 5 min
@@ -108,10 +108,6 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
     if pred_label is not None:
         st = record_pred(uid, sid, pred_label, conf)
 
-    # anti-spam
-    if now - st.last_keepalive_ts < KEEP_ALIVE_S:
-        return False, "cooldown"
-
     #Preguntas por hora
     _prune_hour(st, now)
     if len(st.asks_in_hour) >= MAX_ASKS_PER_H:
@@ -126,8 +122,9 @@ def should_ask(uid: int, sid: int, conf: float, pred_label: str | None = None,
         return True, "uncertainty"
 
     # 3) keep-alive
-    if st.last_label_ts == 0.0 or (now - st.last_label_ts) >= KEEP_ALIVE_S:
+    if st.last_label_ts == 0.0 or (now - max(st.last_label_ts, st.last_ask_ts)) >= KEEP_ALIVE_S:
         return True, "keep_alive"
+
 
     return False, "ok"
 
