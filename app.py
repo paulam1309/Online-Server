@@ -646,32 +646,26 @@ def _sl_make_learner():
 
     if algo == "ARF":
         try:
-            # 1) River >= 0.15
-            from river.forest import AdaptiveRandomForestClassifier as ARFClassifier
-        except Exception:
+            # River >= 0.15+ (actual): ARFClassifier en forest
             try:
-                # 2) River <= 0.14 (ubicación antigua)
-                from river.ensemble import AdaptiveRandomForestClassifier as ARFClassifier
+                from river.forest import ARFClassifier as _ARF
             except Exception:
                 try:
-                    # 3) Algunas builds exponen ARFClassifier en ensemble
-                    from river.ensemble import ARFClassifier
-                except Exception as e:
-                    # 4) Fallback HT
-                    print("WARN: ARF no disponible → usando HT. Detalle:", repr(e))
-                    return tree.HoeffdingTreeClassifier(
-                        grace_period=50,
-                        delta=1e-5,
-                        leaf_prediction="mc",
-                    )
-        # Si llegamos aquí, tenemos ARFClassifier
-        return ARFClassifier(
-            n_models=10,
-            max_features="sqrt",
-            lambda_value=6,
-        )
+                    # Algunas versiones mantienen el nombre largo en forest
+                    from river.forest import AdaptiveRandomForestClassifier as _ARF
+                except Exception:
+                    # Muy legacy: nombre largo en ensemble
+                    from river.ensemble import AdaptiveRandomForestClassifier as _ARF
 
-    # Default / fallback: Hoeffding Tree
+            return _ARF(
+                n_models=10,
+                max_features="sqrt",
+                lambda_value=6,
+            )
+        except Exception as e:
+            print("WARN: ARF no disponible → usando HT. Detalle:", repr(e))
+
+    # Fallback: Hoeffding Tree
     return tree.HoeffdingTreeClassifier(
         grace_period=50,
         delta=1e-5,
@@ -680,30 +674,27 @@ def _sl_make_learner():
 
 
 def _sl2_make_learner():
-    """Construye el learner de SL2 con ARF si está disponible; si no, HT con hiperparámetros distintos."""
+    """Construye el learner B (SL2) con ARF si está pedido, si no HT distinto al A."""
     algo = (SL2_ALGO or "HT").upper()
 
     if algo == "ARF":
         try:
-            from river.forest import AdaptiveRandomForestClassifier as ARFClassifier
-        except Exception:
+            # River >= 0.15+ (actual): ARFClassifier en forest
             try:
-                from river.ensemble import AdaptiveRandomForestClassifier as ARFClassifier
+                from river.forest import ARFClassifier as _ARF
             except Exception:
                 try:
-                    from river.ensemble import ARFClassifier
-                except Exception as e:
-                    print("WARN: SL2 ARF no disponible → usando HT. Detalle:", repr(e))
-                    return tree.HoeffdingTreeClassifier(
-                        grace_period=30,
-                        delta=1e-6,
-                        leaf_prediction="nb",
-                    )
-        return ARFClassifier(
-            n_models=10,
-            max_features="sqrt",
-            lambda_value=6,
-        )
+                    from river.forest import AdaptiveRandomForestClassifier as _ARF
+                except Exception:
+                    from river.ensemble import AdaptiveRandomForestClassifier as _ARF
+
+            return _ARF(
+                n_models=10,
+                max_features="sqrt",
+                lambda_value=6,
+            )
+        except Exception as e:
+            print("WARN: SL2 ARF no disponible → usando HT. Detalle:", repr(e))
 
     # Fallback: HT con hiperparámetros distintos al A
     return tree.HoeffdingTreeClassifier(
