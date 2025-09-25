@@ -686,9 +686,9 @@ def _sl_make_learner():
 
     # Fallback: Hoeffding Tree
     return tree.HoeffdingTreeClassifier(
-        grace_period=50,
+        grace_period=30,
         delta=1e-5,
-        leaf_prediction="mc",
+        leaf_prediction="nb",
     )
 
 
