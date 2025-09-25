@@ -17,7 +17,7 @@ LLama a su vez a policy engine en caso de que la confianza baje del 70%
 
 import os, json, joblib
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
@@ -155,7 +155,7 @@ def schema():
 
 @app.post("/predict_by_window")
 def predict_by_window(req: PredictByWindowReq):
-    global SL_UPDATES, SL_PROMOTED, SL2_UPDATES
+    global SL_UPDATES, SL_PROMOTED, SL2_UPDATES, SL2_PROMOTED
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # 1) Leer ventana
         cur.execute("SELECT * FROM windows WHERE id = %s", (req.id,))
@@ -324,12 +324,23 @@ def predict_by_window(req: PredictByWindowReq):
         # 7) Promoción automática de SL (flag + snapshot) si cumple umbrales
         if SL_ENABLED and not SL_PROMOTED and SL_UPDATES >= SL_PROMOTE_MIN_UPDATES:
             try:
-                acc = float(SL_METRIC.get() or 0.0)
+                acc_a = float(SL_METRIC.get() or 0.0)
             except Exception:
-                acc = 0.0
-            if acc >= SL_PROMOTE_MIN_ACC:
+                acc_a = 0.0
+            if acc_a >= SL_PROMOTE_MIN_ACC:
                 SL_PROMOTED = True
                 _sl_snapshot(conn, promoted=True)
+
+        # B
+        if SL2_ENABLED and not SL2_PROMOTED and SL2_UPDATES >= SL2_PROMOTE_MIN_UPDATES:
+            try:
+                acc_b = float(SL2_METRIC.get() or 0.0)
+            except Exception:
+                acc_b = 0.0
+            if acc_b >= SL2_PROMOTE_MIN_ACC:
+                SL2_PROMOTED = True
+                _sl2_snapshot(conn, promoted=True)
+
 
     return {
         "id": req.id,
@@ -346,6 +357,11 @@ def predict_by_window(req: PredictByWindowReq):
             "algo": SL_ALGO,
             "updates": SL_UPDATES,
             "promoted": SL_PROMOTED
+        },
+        "sl_shadow_b": {
+            "algo": SL2_ALGO,
+            "updates": SL2_UPDATES,
+            "promoted": SL2_PROMOTED
         },
         "classes": list(map(str, CLASSES)),
     }
@@ -617,7 +633,7 @@ def _startup():
 SL_ENABLED: bool = os.getenv("SL_ENABLED", "1") == "1"
 SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
 SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
-SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "500"))
+SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "1000"))
 # Umbrales para promover SL a "principal"
 SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "500"))  # p.ej. 300
 SL_PROMOTE_MIN_ACC     = float(os.getenv("SL_PROMOTE_MIN_ACC", "0.90"))  # p.ej. 0.80 = 80%
@@ -634,6 +650,9 @@ SL2_ENABLED: bool = os.getenv("SL2_ENABLED", "0") == "1"
 SL2_ALGO: str = os.getenv("SL2_ALGO", "ARF")  # prueba ARF; fallback a HT
 SL2_MIN_SHADOW_UPDATES: int = int(os.getenv("SL2_MIN_SHADOW_UPDATES", "50"))
 SL2_SNAPSHOT_EVERY: int = int(os.getenv("SL2_SNAPSHOT_EVERY", "1000"))
+# Umbrales para promover SL-B a "principal"
+SL2_PROMOTE_MIN_UPDATES = int(os.getenv("SL2_PROMOTE_MIN_UPDATES", "500"))
+SL2_PROMOTE_MIN_ACC     = float(os.getenv("SL2_PROMOTE_MIN_ACC", "0.90"))
 
 SL2_LEARNER = None
 SL2_METRIC = metrics.Accuracy()
@@ -759,7 +778,7 @@ def sl_train_pending(req: PredictPendingReq):
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Selecciona SOLO ventanas etiquetadas que aún no han sido usadas por SL
         # (y bloquea filas para evitar condiciones de carrera)
-        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "30"))
+        freeze_secs = int(os.getenv("SL_TRAIN_FREEZE_S", "10"))
 
         cur.execute("""
             SELECT id, features, etiqueta, id_usuario, session_id, start_time, end_time
@@ -877,13 +896,45 @@ def sl_status_all():
         }
     }
 
+
 @app.post("/sl_promote")
-def sl_promote():
-    global SL_PROMOTED
-    SL_PROMOTED = True
+def sl_promote(which: str = Query("auto", pattern="^(A|B|auto)$")):
+    global SL_PROMOTED, SL2_PROMOTED
+
     with get_conn() as conn:
-        _sl_snapshot(conn, promoted=True)  # <-- en vez de _sl_save
-    return {"ok": True, "promoted": True}
+        if which == "A":
+            SL_PROMOTED = True
+            _sl_snapshot(conn, promoted=True)
+            return {"ok": True, "promoted": "A"}
+        elif which == "B":
+            if not SL2_ENABLED or SL2_LEARNER is None:
+                raise HTTPException(400, "SL2 no está habilitado")
+            SL2_PROMOTED = True
+            _sl2_snapshot(conn, promoted=True)
+            return {"ok": True, "promoted": "B"}
+        else:
+            # auto: promueve el que cumpla mejor los umbrales actuales
+            acc_a = float(SL_METRIC.get() or 0.0) if SL_ENABLED and SL_LEARNER else -1.0
+            acc_b = float(SL2_METRIC.get() or 0.0) if SL2_ENABLED and SL2_LEARNER else -1.0
+
+            cand = None
+            if (acc_a >= SL_PROMOTE_MIN_ACC and SL_UPDATES >= SL_PROMOTE_MIN_UPDATES):
+                cand = ("A", acc_a)
+            if (acc_b >= SL2_PROMOTE_MIN_ACC and SL2_UPDATES >= SL2_PROMOTE_MIN_UPDATES):
+                if cand is None or acc_b > cand[1]:
+                    cand = ("B", acc_b)
+
+            if cand is None:
+                raise HTTPException(400, "Ningún modelo cumple condiciones de promoción")
+
+            if cand[0] == "A":
+                SL_PROMOTED = True
+                _sl_snapshot(conn, promoted=True)
+            else:
+                SL2_PROMOTED = True
+                _sl2_snapshot(conn, promoted=True)
+
+            return {"ok": True, "promoted": cand[0]}
 
 @app.post("/sl_reset")
 def sl_reset():
