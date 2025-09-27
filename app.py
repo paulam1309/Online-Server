@@ -708,9 +708,9 @@ def _sl2_make_learner():
                     from river.ensemble import AdaptiveRandomForestClassifier as _ARF
 
             return _ARF(
-                n_models=10,
-                max_features="sqrt",
-                lambda_value=6,
+                n_models=12,
+                max_features="log2",
+                lambda_value=8,
             )
         except Exception as e:
             print("WARN: SL2 ARF no disponible → usando HT. Detalle:", repr(e))
