@@ -635,8 +635,8 @@ SL_ALGO: str = os.getenv("SL_ALGO", "HT")  # por ahora solo HT
 SL_MIN_SHADOW_UPDATES: int = int(os.getenv("SL_MIN_SHADOW_UPDATES", "50"))
 SL_SNAPSHOT_EVERY: int = int(os.getenv("SL_SNAPSHOT_EVERY", "1000"))
 # Umbrales para promover SL a "principal"
-SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "500"))  # p.ej. 300
-SL_PROMOTE_MIN_ACC     = float(os.getenv("SL_PROMOTE_MIN_ACC", "0.90"))  # p.ej. 0.80 = 80%
+SL_PROMOTE_MIN_UPDATES = int(os.getenv("SL_PROMOTE_MIN_UPDATES", "500"))
+SL_PROMOTE_MIN_ACC     = float(os.getenv("SL_PROMOTE_MIN_ACC", "0.90"))
 
 
 SL_LEARNER = None           # modelo online (HT)
@@ -677,9 +677,9 @@ def _sl_make_learner():
                     from river.ensemble import AdaptiveRandomForestClassifier as _ARF
 
             return _ARF(
-                n_models=10,
+                n_models=12,
                 max_features="sqrt",
-                lambda_value=6,
+                lambda_value=8,
             )
         except Exception as e:
             print("WARN: ARF no disponible → usando HT. Detalle:", repr(e))
@@ -709,7 +709,7 @@ def _sl2_make_learner():
 
             return _ARF(
                 n_models=12,
-                max_features="log2",
+                max_features="sqrt",
                 lambda_value=8,
             )
         except Exception as e:
@@ -718,7 +718,7 @@ def _sl2_make_learner():
     # Fallback: HT con hiperparámetros distintos al A
     return tree.HoeffdingTreeClassifier(
         grace_period=30,
-        delta=1e-6,
+        delta=1e-5,
         leaf_prediction="nb",
     )
 
