@@ -1,48 +1,69 @@
-🚀 Online Server – Real-Time ADL Streaming Backend
+# Data Collection System and Stream Learning Model for ADL Classification
 
-📡 Python WebSocket backend deployed on Render
-🎓 Developed for the thesis project:
+## Overview
 
-Data Collection System and Stream Learning Model for Activities of Daily Living (ADL) Classification
+This repository contains the complete implementation of the thesis project:
 
-🌐 Live Deployment (Render):
-🔗 https://online-sensor-backend.onrender.com
+**Data Collection System for Training a Stream Learning Model for Activities of Daily Living (ADL) Classification**
 
-🧠 Overview
+The system was designed to support real-time classification of human activities using inertial data collected from smartphones (accelerometer and gyroscope).
 
-This backend acts as the real-time communication bridge between:
+The project integrates:
 
-📱 Flutter Mobile Client
-🤖 Classification & Stream Learning Pipeline
-💾 Persistence / Logging Layer (optional)
+- Offline supervised training  
+- Online incremental (stream) learning  
+- Selective label request policy  
+- Stability and reaction analysis over time  
 
-It enables real-time streaming of sensor feature windows and supports incremental learning experimentation.
+The architecture follows a client–server model with persistent storage and incremental adaptation.
 
-🏗 System Role in Thesis Architecture
-Flutter Client (Smartphone)
-        ↓
-WebSocket Streaming
-        ↓
-Online Server (Render)
-        ↓
-Prediction + Policy Logic
-        ↓
-Logging / Evaluation / Incremental Update
+---
 
+# Online Server – Real-Time ADL Streaming Backend
 
-This server represents the online experimentation layer of the thesis architecture.
+## Description
 
-✨ Key Features
+This repository contains the Python WebSocket backend deployed on Render as part of the thesis system.
 
-✅ WebSocket-based real-time communication
-✅ JSON-based structured window payloads
-✅ Schema validation (optional)
-✅ Real-time inference (SVM + probability calibrator)
-✅ Selective labeling policy engine (optional)
-✅ Incremental evaluation compatibility (River – HT / ARF)
-✅ Cloud-ready deployment (Render)
+The server is responsible for:
 
-📥 Example Payload (Client → Server)
+- Receiving real-time windowed sensor data from the Flutter mobile client  
+- Validating incoming JSON payloads  
+- Performing optional real-time inference  
+- Supporting the online Stream Learning workflow  
+
+**Live Deployment (Render):**  
+https://online-sensor-backend.onrender.com
+
+---
+
+## System Role in the Architecture
+
+Client (Flutter App)  
+→ Streams feature windows via WebSocket  
+→ Online Server (Render)  
+→ Prediction + policy logic  
+→ Logging / evaluation / incremental update  
+
+This server represents the online experimentation and deployment layer of the thesis architecture.
+
+---
+
+## Key Features
+
+- WebSocket-based real-time communication  
+- Structured JSON window payloads  
+- Schema validation (optional)  
+- Real-time inference (SVM + probability calibrator)  
+- Selective labeling policy engine  
+- Incremental evaluation compatibility (River – HT / ARF)  
+- Cloud-ready deployment (Render)  
+
+---
+
+## Example Payload (Client → Server)
+
+```json
 {
   "device_id": "phone_01",
   "position": "pocket",
@@ -59,8 +80,13 @@ This server represents the online experimentation layer of the thesis architectu
     "user_id": "u01"
   }
 }
+```
 
-📤 Example Payload (Server → Client)
+---
+
+## Example Payload (Server → Client)
+
+```json
 {
   "status": "ok",
   "window_id": "abc123",
@@ -68,52 +94,41 @@ This server represents the online experimentation layer of the thesis architectu
   "confidence": 0.82,
   "request_label": false
 }
+```
 
-🔬 Integration with Thesis Project
+---
 
-This backend integrates with:
+## Technologies Used
 
-📊 Offline Training Pipeline – Scikit-learn baseline models
-🌊 Incremental Learning Models – River (Hoeffding Tree / Adaptive Random Forest)
-🧩 Selective Labeling Policy Engine
-📱 Flutter-based Sensor Client (Android)
+- Python  
+- Async WebSocket server  
+- Scikit-learn (offline baseline model)  
+- River (incremental models – optional integration)  
+- JSON schema validation  
+- Render (cloud deployment)  
 
-It represents the real-time deployment and experimentation stage of the Stream Learning system.
+---
 
-🛠 Technologies Used
+## Academic Context
 
-🐍 Python
+This work contributes to research in:
 
-🔌 Async WebSocket Server
+- Real-time Human Activity Recognition (HAR)  
+- Activities of Daily Living (ADL) classification  
+- Stream Learning methodologies  
+- Incremental model evaluation  
+- Stability and adaptation analysis in evolving systems  
 
-🤖 Scikit-learn (offline baseline)
+---
 
-🌊 River (incremental learning – optional integration)
+## Author
 
-📄 JSON Schema Validation
+Paula M.  
+Electronic and Telecommunications Engineering  
+Universidad del Cauca  
 
-☁️ Render (Cloud Deployment)
+---
 
-🎓 Academic Context
+## License
 
-This repository supports research in:
-
-Real-time Human Activity Recognition (HAR)
-
-Activities of Daily Living (ADL) Classification
-
-Stream Learning methodologies
-
-Incremental evaluation strategies
-
-Model stability and drift behavior analysis
-
-👩‍💻 Author
-
-Paula M.
-Electronic and Telecommunications Engineering
-Universidad del Cauca
-
-📜 License
-
-This repository is intended for academic and research purposes only.
+This repository is intended for academic and research purposes.
